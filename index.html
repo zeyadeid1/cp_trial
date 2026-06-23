@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>School Schedule Studio</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">SS</div>
+          <div>
+            <h1>Schedule Studio</h1>
+            <p>Class and teacher timetables for heads of department</p>
+          </div>
+        </div>
+
+        <nav class="step-nav" aria-label="Setup sections">
+          <button class="nav-item active" data-section="levels">Levels</button>
+          <button class="nav-item" data-section="teachers">Teachers</button>
+          <button class="nav-item" data-section="subjects">Subjects</button>
+          <button class="nav-item" data-section="departments">Departments</button>
+          <button class="nav-item" data-section="classes">Classes</button>
+          <button class="nav-item" data-section="constraints">Constraints</button>
+        </nav>
+
+        <div class="viewer-box">
+          <div class="mini-heading">Signed In</div>
+          <p id="sessionStatus" class="viewer-status">-</p>
+          <button id="logoutBtn" class="ghost">Log Out</button>
+        </div>
+
+        <div class="sidebar-actions">
+          <button id="importExcelBtn" class="secondary full">Import Excel</button>
+          <input id="excelFileInput" type="file" accept=".xlsx" hidden />
+          <button id="loadDemoBtn" class="secondary full">Load Demo</button>
+          <button id="saveBtn" class="secondary full">Save Draft</button>
+          <button id="resetBtn" class="ghost full">Reset</button>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Timetable Builder</p>
+            <h2>Generate, compare, edit, and export school schedules</h2>
+          </div>
+          <div class="topbar-actions">
+            <button id="validateBtn" class="secondary">Check Setup</button>
+            <button id="generateBtn" class="primary">Generate Schedules</button>
+          </div>
+        </header>
+
+        <section id="levels" class="panel-section active">
+          <div class="section-heading">
+            <div>
+              <h3>Levels</h3>
+              <p>Each level (e.g. First Secondary) has its own days, times, and periods.</p>
+            </div>
+            <div class="section-actions">
+              <label class="field class-select-field">
+                <span>Selected Level</span>
+                <select id="levelPicker"></select>
+              </label>
+              <button id="addLevelBtn" class="secondary">Add Level</button>
+              <button id="removeLevelBtn" class="ghost">Remove</button>
+            </div>
+          </div>
+
+          <div class="form-grid three">
+            <label class="field">
+              <span>Level Name</span>
+              <input id="levelName" type="text" placeholder="First Secondary" />
+            </label>
+            <label class="field">
+              <span>Start Time</span>
+              <input id="levelStart" type="time" value="07:30" />
+            </label>
+            <label class="field">
+              <span>End Time (hard limit)</span>
+              <input id="levelEnd" type="time" value="14:30" />
+            </label>
+            <label class="field">
+              <span>Period Length</span>
+              <div class="input-suffix">
+                <input id="levelPeriodLength" type="number" min="20" max="120" value="45" />
+                <b>min</b>
+              </div>
+            </label>
+            <label class="field">
+              <span>Periods Per Day</span>
+              <input id="levelPeriods" type="number" min="1" max="12" value="7" />
+            </label>
+            <label class="field">
+              <span>Break After Period</span>
+              <input id="levelBreakAfter" type="number" min="0" max="12" value="3" />
+            </label>
+            <label class="field">
+              <span>Break Length</span>
+              <div class="input-suffix">
+                <input id="levelBreakLength" type="number" min="0" max="90" value="25" />
+                <b>min</b>
+              </div>
+            </label>
+          </div>
+
+          <div class="mini-heading">School Days</div>
+          <div class="day-picker" id="levelDayPicker" aria-label="School days for this level"></div>
+
+          <div class="mini-heading">Daily Timing</div>
+          <p class="hint">If full-length periods do not fit before the end time, periods after the break are shortened automatically (for days ending before 14:30, only the first 3 periods keep full length). Start and end times are never broken.</p>
+          <div id="levelTimesPreview" class="level-times"></div>
+
+          <label class="check-card advanced-toggle">
+            <input id="customLengthsToggle" type="checkbox" />
+            <span>Advanced: custom period lengths</span>
+            <small>Set the length of each period of this level by hand.</small>
+          </label>
+          <div id="customLengthsWrap" class="custom-length-grid"></div>
+        </section>
+
+        <section id="teachers" class="panel-section">
+          <div class="section-heading">
+            <div>
+              <h3>Teachers</h3>
+              <p>Add availability, load limits, and teachable subjects.</p>
+            </div>
+            <div class="section-actions">
+              <label class="field class-select-field">
+                <span>Search</span>
+                <input id="teacherSearch" type="search" placeholder="Type a teacher name..." />
+              </label>
+              <button id="addTeacherBtn" class="secondary">Add Teacher</button>
+            </div>
+          </div>
+          <p id="teacherSearchInfo" class="hint"></p>
+          <div id="teacherList" class="entity-list"></div>
+        </section>
+
+        <section id="subjects" class="panel-section">
+          <div class="section-heading">
+            <div>
+              <h3>Subjects</h3>
+              <p>Use subject priority to guide placement of difficult lessons.</p>
+            </div>
+            <button id="addSubjectBtn" class="secondary">Add Subject</button>
+          </div>
+          <div id="subjectList" class="entity-list compact"></div>
+        </section>
+
+        <section id="departments" class="panel-section">
+          <div class="section-heading">
+            <div>
+              <h3>Departments</h3>
+              <p>Group subjects under departments and assign a head of department (HOD). The HOD can sign in by name to view the whole department's schedules.</p>
+            </div>
+            <button id="addDepartmentBtn" class="secondary">Add Department</button>
+          </div>
+          <div id="departmentList" class="entity-list compact"></div>
+        </section>
+
+        <section id="classes" class="panel-section">
+          <div class="section-heading">
+            <div>
+              <h3>Classes and Weekly Requirements</h3>
+              <p>A class is a group of students who share the same subjects. Set how many periods each class needs per subject per week.</p>
+            </div>
+            <div class="section-actions">
+              <label class="field class-select-field">
+                <span>Selected Class</span>
+                <select id="classPicker"></select>
+              </label>
+              <button id="addClassBtn" class="secondary">Add Class</button>
+            </div>
+          </div>
+          <div id="classList" class="entity-list"></div>
+        </section>
+
+        <section id="constraints" class="panel-section">
+          <div class="section-heading">
+            <div>
+              <h3>Constraints</h3>
+              <p>Hard rules must be met. Preferences are used to rank alternatives.</p>
+            </div>
+          </div>
+          <div class="constraint-grid">
+            <label class="check-card hard">
+              <input id="honorAvailability" type="checkbox" checked />
+              <span>Honor teacher availability</span>
+              <small>Only schedule teachers in slots marked available.</small>
+            </label>
+            <label class="check-card hard">
+              <input id="preventTeacherClashes" type="checkbox" checked />
+              <span>Prevent teacher clashes</span>
+              <small>A teacher cannot teach two classes at the same time.</small>
+            </label>
+            <label class="check-card hard">
+              <input id="requireQualifiedTeacher" type="checkbox" checked />
+              <span>Require qualified teacher</span>
+              <small>Teachers must be assigned to subjects they can teach.</small>
+            </label>
+            <label class="check-card">
+              <input id="avoidSameSubjectDay" type="checkbox" checked />
+              <span>Avoid duplicate subjects per day</span>
+              <small>Prefer spreading weekly periods across different days.</small>
+            </label>
+            <label class="check-card">
+              <input id="balanceTeacherLoad" type="checkbox" checked />
+              <span>Balance teacher load</span>
+              <small>Prefer not to stack one teacher heavily on one day.</small>
+            </label>
+            <label class="check-card">
+              <input id="avoidClassGaps" type="checkbox" checked />
+              <span>Avoid class gaps</span>
+              <small>Prefer compact class schedules without empty periods.</small>
+            </label>
+            <label class="check-card">
+              <input id="morningCore" type="checkbox" checked />
+              <span>Prioritize core subjects early</span>
+              <small>Higher priority subjects are placed earlier when possible.</small>
+            </label>
+          </div>
+
+          <div class="form-grid three">
+            <label class="field">
+              <span>Max Teacher Periods Per Day (default)</span>
+              <input id="maxTeacherPerDay" type="number" min="1" max="12" value="6" />
+            </label>
+            <label class="field">
+              <span>Max Repeated Subject Per Class Per Day</span>
+              <input id="maxSubjectPerDay" type="number" min="1" max="5" value="1" />
+            </label>
+            <label class="field">
+              <span>Candidate Limit</span>
+              <input id="candidateLimit" type="number" min="1" max="80" value="12" />
+            </label>
+          </div>
+
+          <div class="section-heading">
+            <div>
+              <h3>Session Patterns and Grouped Classes</h3>
+              <p>Set exact lesson block patterns such as 2+3+1, and edit subjects taught to multiple classes as one group.</p>
+            </div>
+          </div>
+          <div id="blockRules" class="block-rules"></div>
+        </section>
+
+        <section class="output-panel">
+          <div class="output-header">
+            <div>
+              <p class="eyebrow">Generated Output</p>
+              <h3 id="outputTitle">No schedule generated yet</h3>
+            </div>
+            <div class="output-actions">
+              <label class="field output-class-picker" id="classPickerWrap">
+                <span>Class</span>
+                <select id="scheduleClassPicker"></select>
+              </label>
+              <label class="field output-class-picker" id="teacherPickerWrap">
+                <span>Teacher</span>
+                <select id="scheduleTeacherPicker"></select>
+              </label>
+              <label class="field output-class-picker" id="departmentPickerWrap">
+                <span>Department</span>
+                <select id="scheduleDepartmentPicker"></select>
+              </label>
+              <label class="field output-class-picker" id="subjectPickerWrap">
+                <span>Subject</span>
+                <select id="scheduleSubjectPicker"></select>
+              </label>
+              <button id="classViewBtn" class="secondary active">Class</button>
+              <button id="teacherViewBtn" class="secondary">Teacher</button>
+              <button id="departmentViewBtn" class="secondary">Department</button>
+              <button id="publishBtn" class="secondary" disabled>Set Official</button>
+              <button id="printBtn" class="primary" disabled>Download PDF</button>
+              <button id="zipBtn" class="primary" disabled>All PDFs (ZIP)</button>
+            </div>
+          </div>
+
+          <div id="alerts" class="alerts"></div>
+          <div id="scheduleTabs" class="schedule-tabs"></div>
+          <div id="scheduleCanvas" class="schedule-canvas empty">
+            <div class="empty-state">
+              <h4>Build your first timetable</h4>
+              <p>Add teachers, subjects, classes, and weekly requirements, then generate schedules. You can edit any lesson before exporting.</p>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="loginOverlay" class="login-overlay">
+      <div class="login-card">
+        <div class="brand-mark">SS</div>
+        <h2>Schedule Studio</h2>
+        <p class="login-sub">Sign in to continue</p>
+        <label class="field">
+          <span>Username</span>
+          <input id="loginUsername" type="text" placeholder="admin or firstname_secondname" autocomplete="username" />
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input id="loginPassword" type="password" autocomplete="current-password" />
+        </label>
+        <p id="loginError" class="login-error"></p>
+        <button id="loginBtn" class="primary full">Sign In</button>
+        <p class="login-hint">Admin: admin / admin. Teachers: firstname_secondname, password is the second name (e.g. Rania Aly signs in as rania_aly / aly).</p>
+      </div>
+    </div>
+
+    <dialog id="lessonDialog" class="lesson-dialog">
+      <form method="dialog">
+        <header>
+          <h3>Edit Lesson</h3>
+          <button value="cancel" class="icon-button" aria-label="Close">x</button>
+        </header>
+        <div class="form-grid two">
+          <label class="field">
+            <span>Subject</span>
+            <select id="editSubject"></select>
+          </label>
+          <label class="field">
+            <span>Teacher</span>
+            <select id="editTeacher"></select>
+          </label>
+          <label class="field">
+            <span>Note</span>
+            <input id="editNote" type="text" placeholder="Optional note" />
+          </label>
+          <label class="check-card">
+            <input id="editLate" type="checkbox" />
+            <span>Possibly late</span>
+            <small>Reserve this slot for the teacher and assigned replacement teachers.</small>
+          </label>
+        </div>
+        <footer>
+          <div>
+            <button id="clearLessonBtn" value="clear" class="danger">Clear Slot</button>
+            <button id="moveLessonBtn" value="move" class="secondary">Move / Swap</button>
+          </div>
+          <div>
+            <button value="cancel" class="secondary">Cancel</button>
+            <button id="saveLessonBtn" value="save" class="primary">Save</button>
+          </div>
+        </footer>
+      </form>
+    </dialog>
+
+    <template id="teacherTemplate">
+      <article class="entity-card teacher-card">
+        <div class="entity-card-header">
+          <label class="field title-field">
+            <span>Teacher Name</span>
+            <input data-field="name" type="text" placeholder="Teacher name" />
+          </label>
+          <button class="ghost remove-entity" type="button">Remove</button>
+        </div>
+        <div class="form-grid three">
+          <label class="field">
+            <span>Can Teach</span>
+            <select data-field="subjects" multiple></select>
+          </label>
+          <label class="field">
+            <span>Max Periods Per Day</span>
+            <input data-field="maxPerDay" type="number" min="1" max="12" />
+          </label>
+          <label class="field">
+            <span>Replacement Teachers</span>
+            <select data-field="replacements" multiple></select>
+          </label>
+        </div>
+        <div>
+          <div class="mini-heading">Availability</div>
+          <div class="availability-grid"></div>
+        </div>
+      </article>
+    </template>
+
+    <template id="subjectTemplate">
+      <article class="entity-card subject-card">
+        <div class="form-grid four">
+          <label class="field">
+            <span>Subject</span>
+            <input data-field="name" type="text" placeholder="Mathematics" />
+          </label>
+          <label class="field">
+            <span>Short Name</span>
+            <input data-field="shortName" type="text" placeholder="Math" />
+          </label>
+          <label class="field">
+            <span>Priority</span>
+            <select data-field="priority">
+              <option value="core">Core</option>
+              <option value="standard">Standard</option>
+              <option value="light">Light</option>
+            </select>
+          </label>
+          <label class="field color-field">
+            <span>Color</span>
+            <input data-field="color" type="color" />
+          </label>
+        </div>
+        <button class="ghost remove-entity" type="button">Remove Subject</button>
+      </article>
+    </template>
+
+    <template id="departmentTemplate">
+      <article class="entity-card department-card">
+        <div class="entity-card-header">
+          <label class="field title-field">
+            <span>Department Name</span>
+            <input data-field="name" type="text" placeholder="Science" />
+          </label>
+          <button class="ghost remove-entity" type="button">Remove</button>
+        </div>
+        <div class="form-grid two">
+          <label class="field">
+            <span>Subjects</span>
+            <select data-field="subjects" multiple></select>
+          </label>
+          <label class="field">
+            <span>Head of Department</span>
+            <select data-field="hod"></select>
+          </label>
+        </div>
+      </article>
+    </template>
+
+    <template id="classTemplate">
+      <article class="entity-card class-card">
+        <div class="entity-card-header">
+          <label class="field title-field">
+            <span>Class Name</span>
+            <input data-field="name" type="text" placeholder="First Secondary A" />
+          </label>
+          <button class="ghost remove-entity" type="button">Remove</button>
+        </div>
+        <div class="form-grid three">
+          <label class="field">
+            <span>Level</span>
+            <select data-field="level"></select>
+          </label>
+          <label class="field">
+            <span>Blocked Slots</span>
+            <button class="secondary block-slots-btn" type="button">Edit Unavailable Times</button>
+          </label>
+        </div>
+        <div class="requirements"></div>
+      </article>
+    </template>
+
+    <script src="app.js"></script>
+  </body>
+</html>
