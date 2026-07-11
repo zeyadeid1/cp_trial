@@ -25,6 +25,7 @@ const state = {
   classes: [],
   departments: [],
   groupingRules: [],
+  electiveRules: [],
   schedules: [],
   selectedSchedule: 0,
   selectedLevelId: "",
@@ -39,6 +40,7 @@ const state = {
   editTarget: null,
   dragLesson: null,
   moveSource: null,
+  lastSavedAt: null,
 };
 
 const els = {};
@@ -59,6 +61,7 @@ function cacheElements() {
     "levelStart",
     "levelEnd",
     "levelPeriodLength",
+    "levelMinPeriod",
     "levelPeriods",
     "levelBreakAfter",
     "levelBreakLength",
@@ -66,6 +69,8 @@ function cacheElements() {
     "levelTimesPreview",
     "customLengthsToggle",
     "customLengthsWrap",
+    "dayOverridesToggle",
+    "dayOverridesWrap",
     "teacherSearch",
     "teacherSearchInfo",
     "teacherList",
@@ -105,9 +110,11 @@ function cacheElements() {
     "departmentPickerWrap",
     "subjectPickerWrap",
     "alerts",
+    "violationPanel",
     "scheduleTabs",
     "scheduleCanvas",
     "outputTitle",
+    "saveStatus",
     "lessonDialog",
     "editSubject",
     "editTeacher",
@@ -151,6 +158,7 @@ function bindGlobalEvents() {
     }
     state.levels = state.levels.filter((item) => item.id !== level.id);
     state.groupingRules = state.groupingRules.filter((rule) => rule.levelId !== level.id);
+    state.electiveRules = (state.electiveRules || []).filter((rule) => rule.levelId !== level.id);
     state.selectedLevelId = state.levels[0]?.id || "";
     normalizeAvailability();
     renderAll();
@@ -164,7 +172,8 @@ function bindGlobalEvents() {
   [
     ["levelStart", (level, value) => (level.startTime = value || level.startTime)],
     ["levelEnd", (level, value) => (level.endTime = value || level.endTime)],
-    ["levelPeriodLength", (level, value) => (level.periodLength = clampNumber(value, MIN_PERIOD_LENGTH, 120, level.periodLength))],
+    ["levelPeriodLength", (level, value) => (level.periodLength = clampNumber(value, levelMinPeriod(level), 240, level.periodLength))],
+    ["levelMinPeriod", (level, value) => (level.minPeriodLength = clampNumber(value, 5, 120, MIN_PERIOD_LENGTH))],
     ["levelPeriods", (level, value) => setLevelPeriods(level, clampNumber(value, 1, 12, level.periodsPerDay))],
     ["levelBreakAfter", (level, value) => (level.breakAfter = clampNumber(value, 0, 12, level.breakAfter))],
     ["levelBreakLength", (level, value) => (level.breakLength = clampNumber(value, 0, 90, level.breakLength))],
@@ -181,6 +190,16 @@ function bindGlobalEvents() {
     const level = selectedLevel();
     if (!level) return;
     level.customLengths = els.customLengthsToggle.checked ? effectivePeriodLengths(level) : null;
+    renderAll();
+  });
+  els.dayOverridesToggle.addEventListener("change", () => {
+    const level = selectedLevel();
+    if (!level) return;
+    level.showDayOverrides = els.dayOverridesToggle.checked;
+    if (!els.dayOverridesToggle.checked) {
+      level.dayOverrides = {};
+      normalizeAvailability();
+    }
     renderAll();
   });
 
@@ -292,8 +311,10 @@ function bindGlobalEvents() {
     showAlerts([{ type: "success", text: "Demo data loaded." }]);
   });
   els.saveBtn.addEventListener("click", () => {
-    saveToStorage();
-    showAlerts([{ type: "success", text: "Draft saved in this browser." }]);
+    const saved = saveToStorage();
+    showAlerts([saved
+      ? { type: "success", text: "Saved. Your setup and schedules are restored automatically when you come back, refresh, or sign out and in again on this browser." }
+      : { type: "error", text: "Saving failed - this browser's storage is full or unavailable. Your work stays in memory for this session only." }]);
   });
   els.resetBtn.addEventListener("click", () => {
     localStorage.removeItem(STORAGE_KEY);
@@ -302,8 +323,14 @@ function bindGlobalEvents() {
     state.teachers = [];
     state.classes = [];
     state.departments = [];
+    state.electiveRules = [];
     renderAll();
     showAlerts([{ type: "success", text: "Draft reset." }]);
+  });
+  // Autosave runs on every change already; this catches anything in-flight
+  // when the tab closes or refreshes.
+  window.addEventListener("beforeunload", () => {
+    saveToStorage();
   });
 
   els.saveLessonBtn.addEventListener("click", (event) => {
@@ -346,10 +373,13 @@ function createLevel(name = "Level", overrides = {}) {
     startTime: "07:30",
     endTime: "14:30",
     periodLength: 45,
+    minPeriodLength: MIN_PERIOD_LENGTH,
     periodsPerDay: 7,
     breakAfter: 3,
     breakLength: 25,
     customLengths: null,
+    dayOverrides: {},
+    showDayOverrides: false,
     subjectBlocks: {},
     sessionPatterns: {},
   }, overrides);
@@ -390,7 +420,7 @@ function unionDays() {
 }
 
 function maxSlots() {
-  return Math.max(1, ...state.levels.map((level) => level.periodsPerDay));
+  return Math.max(1, ...state.levels.map((level) => maxPeriodsForLevel(level)));
 }
 
 function timeToMinutes(value) {
@@ -404,44 +434,84 @@ function minutesToTime(total) {
   return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
 }
 
-function effectiveBreakLength(level) {
-  return level.breakAfter > 0 && level.breakAfter < level.periodsPerDay && level.breakLength > 0 ? level.breakLength : 0;
+function levelMinPeriod(level) {
+  return clampNumber(level.minPeriodLength ?? MIN_PERIOD_LENGTH, 5, 120, MIN_PERIOD_LENGTH);
 }
 
-// Period lengths for a level. If full-length periods do not fit between the
-// start and end times, periods after the break are shortened evenly. For days
-// that end before 14:30, only the first 3 periods keep full length. The end
-// time is a hard limit; validation flags levels that cannot fit at all.
-function effectivePeriodLengths(level) {
-  const count = Math.max(1, level.periodsPerDay);
-  if (Array.isArray(level.customLengths) && level.customLengths.length === count) {
-    return level.customLengths.map((length) => clampNumber(length, MIN_PERIOD_LENGTH, 120, level.periodLength));
+// A day override lets one day of the week diverge from the level's base
+// timing (start, end, period count, break, and per-period lengths).
+function dayOverride(level, day) {
+  const override = level.dayOverrides?.[day];
+  return override && typeof override === "object" ? override : null;
+}
+
+// Effective timing config for one day of a level (base values merged with the
+// day's override). Pass no day to get the level's base config.
+function dayConfig(level, day = null) {
+  const override = day ? dayOverride(level, day) : null;
+  return {
+    startTime: override?.startTime || level.startTime,
+    endTime: override?.endTime || level.endTime,
+    periodsPerDay: clampNumber(override?.periodsPerDay ?? level.periodsPerDay, 1, 12, level.periodsPerDay),
+    breakAfter: clampNumber(override?.breakAfter ?? level.breakAfter, 0, 12, level.breakAfter),
+    breakLength: clampNumber(override?.breakLength ?? level.breakLength, 0, 90, level.breakLength),
+    periodLength: level.periodLength,
+    customLengths: Array.isArray(override?.periodLengths) && override.periodLengths.length
+      ? override.periodLengths
+      : level.customLengths,
+  };
+}
+
+function periodsForDay(level, day) {
+  return dayConfig(level, day).periodsPerDay;
+}
+
+function maxPeriodsForLevel(level) {
+  return Math.max(1, level.periodsPerDay, ...level.days.map((day) => periodsForDay(level, day)));
+}
+
+function effectiveBreakLength(config) {
+  return config.breakAfter > 0 && config.breakAfter < config.periodsPerDay && config.breakLength > 0 ? config.breakLength : 0;
+}
+
+// Period lengths for a level on a given day. If full-length periods do not
+// fit between the start and end times, periods after the break are shortened
+// evenly (never below the level's minimum period length). For days that end
+// before 14:30, only the first 3 periods keep full length. The end time is a
+// hard limit; validation flags days that cannot fit at all.
+function effectivePeriodLengths(level, day = null) {
+  const config = dayConfig(level, day);
+  const minLength = levelMinPeriod(level);
+  const count = Math.max(1, config.periodsPerDay);
+  if (Array.isArray(config.customLengths) && config.customLengths.length === count) {
+    return config.customLengths.map((length) => clampNumber(length, minLength, 240, config.periodLength));
   }
-  const window = timeToMinutes(level.endTime) - timeToMinutes(level.startTime) - effectiveBreakLength(level);
-  const lengths = Array.from({ length: count }, () => level.periodLength);
-  if (count * level.periodLength <= window) return lengths;
-  const endsEarly = timeToMinutes(level.endTime) < timeToMinutes(EARLY_END);
-  const fixedCount = Math.max(0, Math.min(endsEarly ? 3 : level.breakAfter, count - 1));
+  const window = timeToMinutes(config.endTime) - timeToMinutes(config.startTime) - effectiveBreakLength(config);
+  const lengths = Array.from({ length: count }, () => config.periodLength);
+  if (count * config.periodLength <= window) return lengths;
+  const endsEarly = timeToMinutes(config.endTime) < timeToMinutes(EARLY_END);
+  const fixedCount = Math.max(0, Math.min(endsEarly ? 3 : config.breakAfter, count - 1));
   const rest = count - fixedCount;
-  const restLength = Math.max(MIN_PERIOD_LENGTH, Math.min(level.periodLength, Math.floor((window - fixedCount * level.periodLength) / rest)));
+  const restLength = Math.max(minLength, Math.min(config.periodLength, Math.floor((window - fixedCount * config.periodLength) / rest)));
   for (let index = fixedCount; index < count; index++) lengths[index] = restLength;
   return lengths;
 }
 
-function levelTimes(level) {
-  const lengths = effectivePeriodLengths(level);
+function levelTimes(level, day = null) {
+  const config = dayConfig(level, day);
+  const lengths = effectivePeriodLengths(level, day);
   const periods = [];
-  let current = timeToMinutes(level.startTime);
+  let current = timeToMinutes(config.startTime);
   let breakInfo = null;
   lengths.forEach((length, index) => {
     periods.push({ start: minutesToTime(current), end: minutesToTime(current + length), length });
     current += length;
-    if (level.breakAfter === index + 1 && effectiveBreakLength(level)) {
-      breakInfo = { afterIndex: index, start: minutesToTime(current), end: minutesToTime(current + level.breakLength), length: level.breakLength };
-      current += level.breakLength;
+    if (config.breakAfter === index + 1 && effectiveBreakLength(config)) {
+      breakInfo = { afterIndex: index, start: minutesToTime(current), end: minutesToTime(current + config.breakLength), length: config.breakLength };
+      current += config.breakLength;
     }
   });
-  return { periods, breakInfo, endsAt: minutesToTime(current), fits: current <= timeToMinutes(level.endTime) };
+  return { periods, breakInfo, endsAt: minutesToTime(current), fits: current <= timeToMinutes(config.endTime) };
 }
 
 function referenceLevel() {
@@ -488,7 +558,7 @@ function createClass(name = "", levelId = "", requirements = []) {
     requirements,
   };
   (level?.days || []).forEach((day) => {
-    item.blocked[day] = Array.from({ length: level.periodsPerDay }, () => false);
+    item.blocked[day] = Array.from({ length: periodsForDay(level, day) }, () => false);
   });
   return item;
 }
@@ -511,6 +581,25 @@ function createGroupingRule(overrides = {}) {
     teacherId: "",
     periodsPerGroup: 0,
     notes: "",
+  }, overrides);
+}
+
+// An elective split: part of each listed class takes one subject while the
+// rest take another, at the same time. The matching students from all listed
+// classes combine into one teaching group per subject, so every occurrence
+// needs one free teacher per option simultaneously and shows as a combined
+// "German / French" cell on the class schedules.
+function createElectiveRule(overrides = {}) {
+  return Object.assign({
+    id: uid("elx"),
+    name: "Second language",
+    levelId: "",
+    classIds: [],
+    count: 0,
+    options: [
+      { subject: "", teacherId: "" },
+      { subject: "", teacherId: "" },
+    ],
   }, overrides);
 }
 
@@ -543,6 +632,7 @@ function loadDemo() {
   state.classes = buildDefaultClasses();
   state.departments = buildDefaultDepartments();
   state.groupingRules = [];
+  state.electiveRules = buildDefaultElectiveRules();
   state.schedules = [];
   state.selectedSchedule = 0;
   state.selectedLevelId = state.levels[0].id;
@@ -597,7 +687,9 @@ function buildDefaultClasses() {
   const letters = "ABCDE".split("");
   const classes = [];
   const plans = [
-    [state.levels[0], (index) => [
+    // First Secondary second language comes from an elective split rule
+    // (French/German at the same time), not per-class requirements.
+    [state.levels[0], () => [
       req("Science", 6),
       req("Arabic", 6),
       req("English", 7),
@@ -605,7 +697,6 @@ function buildDefaultClasses() {
       req("History", 5),
       req("Philosophy", 4),
       req("Religion", 2),
-      req(index % 2 === 0 ? "French" : "German", 3),
     ]],
     [state.levels[1], (index) => [
       req("Arabic", 6),
@@ -633,6 +724,25 @@ function buildDefaultClasses() {
     });
   });
   return classes;
+}
+
+function buildDefaultElectiveRules() {
+  const level = state.levels[0];
+  if (!level) return [];
+  const classes = state.classes.filter((klass) => klass.levelId === level.id);
+  if (!classes.length) return [];
+  const half = Math.ceil(classes.length / 2);
+  const groups = [classes.slice(0, half), classes.slice(half)].filter((group) => group.length);
+  return groups.map((group, index) => createElectiveRule({
+    name: groups.length > 1 ? `Second Language ${String.fromCharCode(65 + index)}` : "Second Language",
+    levelId: level.id,
+    classIds: group.map((klass) => klass.id),
+    count: 3,
+    options: [
+      { subject: "French", teacherId: "" },
+      { subject: "German", teacherId: "" },
+    ],
+  }));
 }
 
 function buildDefaultDepartments() {
@@ -686,6 +796,7 @@ function renderLevels() {
   els.levelStart.value = level.startTime;
   els.levelEnd.value = level.endTime;
   els.levelPeriodLength.value = level.periodLength;
+  els.levelMinPeriod.value = levelMinPeriod(level);
   els.levelPeriods.value = level.periodsPerDay;
   els.levelBreakAfter.value = level.breakAfter;
   els.levelBreakLength.value = level.breakLength;
@@ -711,39 +822,183 @@ function renderLevels() {
     els.levelDayPicker.append(label);
   });
 
-  const times = levelTimes(level);
-  els.levelTimesPreview.innerHTML = "";
-  times.periods.forEach((period, index) => {
-    const chip = document.createElement("span");
-    chip.className = "time-chip";
-    chip.textContent = `P${index + 1} ${period.start}-${period.end} (${period.length}m)`;
-    els.levelTimesPreview.append(chip);
-    if (times.breakInfo && times.breakInfo.afterIndex === index) {
-      const breakChip = document.createElement("span");
-      breakChip.className = "time-chip break-chip";
-      breakChip.textContent = `Break ${times.breakInfo.start}-${times.breakInfo.end} (${times.breakInfo.length}m)`;
-      els.levelTimesPreview.append(breakChip);
-    }
-  });
-  const status = document.createElement("span");
-  status.className = `time-chip ${times.fits ? "ok-chip" : "error-chip"}`;
-  status.textContent = times.fits ? `Day ends ${times.endsAt} (limit ${level.endTime})` : `Does not fit: ends ${times.endsAt}, limit ${level.endTime}`;
-  els.levelTimesPreview.append(status);
+  renderLevelTimesPreview(level);
 
   els.customLengthsToggle.checked = Array.isArray(level.customLengths);
   els.customLengthsWrap.innerHTML = "";
   if (Array.isArray(level.customLengths)) {
+    const minLength = levelMinPeriod(level);
     level.customLengths.forEach((length, index) => {
       const field = document.createElement("label");
       field.className = "field";
-      field.innerHTML = `<span>P${index + 1} (min)</span><input type="number" min="${MIN_PERIOD_LENGTH}" max="120" value="${length}" />`;
+      field.innerHTML = `<span>P${index + 1} (min)</span><input type="number" min="${minLength}" max="240" value="${length}" />`;
       field.querySelector("input").addEventListener("change", (event) => {
-        level.customLengths[index] = clampNumber(event.target.value, MIN_PERIOD_LENGTH, 120, level.periodLength);
+        level.customLengths[index] = clampNumber(event.target.value, minLength, 240, level.periodLength);
         renderAll();
       });
       els.customLengthsWrap.append(field);
     });
   }
+
+  renderDayOverrides(level);
+}
+
+// Daily timing preview. One line for the level's base timing, plus one line
+// per day that has its own override.
+function renderLevelTimesPreview(level) {
+  els.levelTimesPreview.innerHTML = "";
+  const overrideDays = level.days.filter((day) => dayOverride(level, day));
+  const rows = [{ label: overrideDays.length ? "Default days" : "", day: null }];
+  overrideDays.forEach((day) => rows.push({ label: day, day }));
+  rows.forEach(({ label, day }) => {
+    const line = document.createElement("div");
+    line.className = "level-times-line";
+    if (label) {
+      const tag = document.createElement("span");
+      tag.className = "time-chip day-chip";
+      tag.textContent = label;
+      line.append(tag);
+    }
+    const config = dayConfig(level, day);
+    const times = levelTimes(level, day);
+    times.periods.forEach((period, index) => {
+      const chip = document.createElement("span");
+      chip.className = "time-chip";
+      chip.textContent = `P${index + 1} ${period.start}-${period.end} (${period.length}m)`;
+      line.append(chip);
+      if (times.breakInfo && times.breakInfo.afterIndex === index) {
+        const breakChip = document.createElement("span");
+        breakChip.className = "time-chip break-chip";
+        breakChip.textContent = `Break ${times.breakInfo.start}-${times.breakInfo.end} (${times.breakInfo.length}m)`;
+        line.append(breakChip);
+      }
+    });
+    const status = document.createElement("span");
+    status.className = `time-chip ${times.fits ? "ok-chip" : "error-chip"}`;
+    status.textContent = times.fits ? `Ends ${times.endsAt} (limit ${config.endTime})` : `Does not fit: ends ${times.endsAt}, limit ${config.endTime}`;
+    line.append(status);
+    els.levelTimesPreview.append(line);
+  });
+}
+
+// Advanced per-day options: each school day can override the level's start,
+// end, period count, break, and individual period lengths.
+function renderDayOverrides(level) {
+  const anyOverrides = level.days.some((day) => dayOverride(level, day));
+  const open = Boolean(level.showDayOverrides || anyOverrides);
+  els.dayOverridesToggle.checked = open;
+  els.dayOverridesWrap.classList.toggle("hidden", !open);
+  els.dayOverridesWrap.innerHTML = "";
+  if (!open) return;
+  level.days.forEach((day) => {
+    const override = dayOverride(level, day);
+    const row = document.createElement("div");
+    row.className = `day-override-row${override ? " active" : ""}`;
+
+    const head = document.createElement("label");
+    head.className = "day-override-head";
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.checked = Boolean(override);
+    check.addEventListener("change", () => {
+      level.dayOverrides ||= {};
+      if (check.checked) {
+        level.dayOverrides[day] = {
+          startTime: level.startTime,
+          endTime: level.endTime,
+          periodsPerDay: level.periodsPerDay,
+          breakAfter: level.breakAfter,
+          breakLength: level.breakLength,
+          periodLengths: null,
+        };
+      } else {
+        delete level.dayOverrides[day];
+      }
+      normalizeAvailability();
+      renderAll();
+    });
+    const dayName = document.createElement("strong");
+    dayName.textContent = day;
+    const summary = document.createElement("small");
+    summary.textContent = override
+      ? `${dayConfig(level, day).startTime}-${dayConfig(level, day).endTime}, ${periodsForDay(level, day)} periods`
+      : "Uses the level's default timing";
+    head.append(check, dayName, summary);
+    row.append(head);
+
+    if (override) {
+      const grid = document.createElement("div");
+      grid.className = "day-override-grid";
+      const commit = (field, value) => {
+        override[field] = value;
+        normalizeAvailability();
+        renderAll();
+      };
+      grid.append(
+        overrideField("Start", "time", override.startTime || level.startTime, (value) => commit("startTime", value || level.startTime)),
+        overrideField("End", "time", override.endTime || level.endTime, (value) => commit("endTime", value || level.endTime)),
+        overrideField("Periods", "number", override.periodsPerDay ?? level.periodsPerDay, (value) => {
+          const periods = clampNumber(value, 1, 12, level.periodsPerDay);
+          if (Array.isArray(override.periodLengths)) {
+            override.periodLengths = Array.from({ length: periods }, (_, index) => override.periodLengths[index] ?? level.periodLength);
+          }
+          commit("periodsPerDay", periods);
+        }, { min: 1, max: 12 }),
+        overrideField("Break After", "number", override.breakAfter ?? level.breakAfter, (value) => commit("breakAfter", clampNumber(value, 0, 12, level.breakAfter)), { min: 0, max: 12 }),
+        overrideField("Break (min)", "number", override.breakLength ?? level.breakLength, (value) => commit("breakLength", clampNumber(value, 0, 90, level.breakLength)), { min: 0, max: 90 }),
+      );
+      row.append(grid);
+
+      const lengthsToggle = document.createElement("label");
+      lengthsToggle.className = "check-card advanced-toggle";
+      const lengthsCheck = document.createElement("input");
+      lengthsCheck.type = "checkbox";
+      lengthsCheck.checked = Array.isArray(override.periodLengths) && override.periodLengths.length > 0;
+      const lengthsLabel = document.createElement("span");
+      lengthsLabel.textContent = "Custom period lengths for this day";
+      const lengthsHint = document.createElement("small");
+      lengthsHint.textContent = "Set each period's minutes for this day only.";
+      lengthsToggle.append(lengthsCheck, lengthsLabel, lengthsHint);
+      lengthsCheck.addEventListener("change", () => {
+        override.periodLengths = lengthsCheck.checked ? effectivePeriodLengths(level, day) : null;
+        renderAll();
+      });
+      row.append(lengthsToggle);
+
+      if (Array.isArray(override.periodLengths) && override.periodLengths.length) {
+        const lengthGrid = document.createElement("div");
+        lengthGrid.className = "custom-length-grid";
+        const minLength = levelMinPeriod(level);
+        override.periodLengths.forEach((length, index) => {
+          const field = document.createElement("label");
+          field.className = "field";
+          field.innerHTML = `<span>P${index + 1} (min)</span><input type="number" min="${minLength}" max="240" value="${length}" />`;
+          field.querySelector("input").addEventListener("change", (event) => {
+            override.periodLengths[index] = clampNumber(event.target.value, minLength, 240, level.periodLength);
+            renderAll();
+          });
+          lengthGrid.append(field);
+        });
+        row.append(lengthGrid);
+      }
+    }
+    els.dayOverridesWrap.append(row);
+  });
+}
+
+function overrideField(label, type, value, onChange, attrs = {}) {
+  const field = document.createElement("label");
+  field.className = "field";
+  const span = document.createElement("span");
+  span.textContent = label;
+  const input = document.createElement("input");
+  input.type = type;
+  if (attrs.min !== undefined) input.min = String(attrs.min);
+  if (attrs.max !== undefined) input.max = String(attrs.max);
+  input.value = value;
+  input.addEventListener("change", () => onChange(input.value));
+  field.append(span, input);
+  return field;
 }
 
 function renderTeachers() {
@@ -800,6 +1055,9 @@ function renderTeachers() {
       state.departments.forEach((department) => {
         if (department.hodTeacherId === teacher.id) department.hodTeacherId = "";
       });
+      (state.electiveRules || []).forEach((rule) => rule.options.forEach((option) => {
+        if (option.teacherId === teacher.id) option.teacherId = "";
+      }));
       if (state.session?.teacherId === teacher.id) state.session = null;
       renderAll();
     });
@@ -848,6 +1106,9 @@ function renderSubjects() {
         delete level.sessionPatterns?.[subject.name];
       });
       state.groupingRules = state.groupingRules.filter((rule) => rule.subject !== subject.name);
+      (state.electiveRules || []).forEach((rule) => {
+        rule.options = rule.options.filter((option) => option.subject !== subject.name);
+      });
       if (state.selectedDeptSubject === subject.name) state.selectedDeptSubject = "";
       renderAll();
     });
@@ -882,6 +1143,9 @@ function updateSubjectName(subject, value) {
   state.groupingRules.forEach((rule) => {
     if (rule.subject === oldName) rule.subject = value;
   });
+  (state.electiveRules || []).forEach((rule) => rule.options.forEach((option) => {
+    if (option.subject === oldName) option.subject = value;
+  }));
   if (state.selectedDeptSubject === oldName) state.selectedDeptSubject = value;
 }
 
@@ -1052,10 +1316,10 @@ function toggleBlockedGrid(card, klass) {
   if (!level) return;
   grid = document.createElement("div");
   grid.className = "blocked-grid";
-  renderSlotGrid(grid, klass.blocked, level.days, level.periodsPerDay, false, (day, slot, checked) => {
+  renderSlotGrid(grid, klass.blocked, level.days, maxPeriodsForLevel(level), false, (day, slot, checked) => {
     klass.blocked[day][slot] = checked;
     saveToStorage();
-  }, "Blocked", "Open");
+  }, "Blocked", "Open", (day) => periodsForDay(level, day));
   card.append(grid);
 }
 
@@ -1122,6 +1386,139 @@ function renderBlockRules() {
     groupCard.append(renderGroupingRuleEditor(rule));
   });
   els.blockRules.append(groupCard);
+  els.blockRules.append(renderElectiveRulesCard());
+}
+
+// Editor for elective splits: part of each selected class takes one subject
+// while the rest take another, at the same time. Students from all selected
+// classes combine into one teaching group per subject.
+function renderElectiveRulesCard() {
+  const card = document.createElement("article");
+  card.className = "entity-card block-rule-card";
+  const header = document.createElement("div");
+  header.className = "entity-card-header";
+  const heading = document.createElement("div");
+  heading.className = "mini-heading";
+  heading.textContent = "Elective splits (parallel subjects, e.g. German/French)";
+  const addButton = document.createElement("button");
+  addButton.type = "button";
+  addButton.className = "secondary";
+  addButton.textContent = "Add Elective Split";
+  addButton.addEventListener("click", () => {
+    state.electiveRules.push(createElectiveRule({ levelId: selectedLevel()?.id || state.levels[0]?.id || "" }));
+    renderAll();
+  });
+  header.append(heading, addButton);
+  card.append(header);
+  const hint = document.createElement("p");
+  hint.className = "hint";
+  hint.textContent = "Each class in the split divides its students between the listed subjects during the same periods. Matching students from all selected classes are taught together as one group per subject, and the class schedule shows a combined cell like \"German / French\". Do not also give these classes separate weekly requirements for the listed subjects.";
+  card.append(hint);
+  if (!(state.electiveRules || []).length) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "No elective splits defined.";
+    card.append(empty);
+  }
+  (state.electiveRules || []).forEach((rule) => card.append(renderElectiveRuleEditor(rule)));
+  return card;
+}
+
+function renderElectiveRuleEditor(rule) {
+  const row = document.createElement("div");
+  row.className = "group-rule-editor elective-rule-editor";
+
+  const nameInput = textInput(rule.name, (value) => (rule.name = value));
+
+  const levelSelect = document.createElement("select");
+  populateOptions(levelSelect, state.levels.map((level) => level.id), [rule.levelId || state.levels[0]?.id || ""], (id) => levelById(id)?.name || id);
+  levelSelect.addEventListener("change", () => {
+    rule.levelId = levelSelect.value;
+    rule.classIds = [];
+    renderAll();
+  });
+
+  const classSelect = document.createElement("select");
+  classSelect.multiple = true;
+  const levelClasses = state.classes.filter((klass) => klass.levelId === (rule.levelId || state.levels[0]?.id));
+  populateOptions(classSelect, levelClasses.map((klass) => klass.id), rule.classIds || [], (id) => classById(id)?.name || id);
+  classSelect.addEventListener("change", () => {
+    rule.classIds = [...classSelect.selectedOptions].map((option) => option.value);
+    saveToStorage();
+  });
+
+  const countInput = numberInput(rule.count, 0, 20, (value) => (rule.count = value));
+
+  row.append(
+    fieldWrap("Rule Name", nameInput),
+    fieldWrap("Level", levelSelect),
+    fieldWrap("Classes That Split", classSelect),
+    fieldWrap("Periods / Week", countInput),
+  );
+
+  const optionsWrap = document.createElement("div");
+  optionsWrap.className = "elective-options";
+  (rule.options || []).forEach((option, index) => {
+    const optionRow = document.createElement("div");
+    optionRow.className = "elective-option-row";
+
+    const subjectSelect = document.createElement("select");
+    populateOptions(subjectSelect, ["", ...state.subjects.map((subject) => subject.name)], [option.subject || ""], (value) => value || "Pick a subject");
+    subjectSelect.addEventListener("change", () => {
+      option.subject = subjectSelect.value;
+      option.teacherId = "";
+      renderAll();
+    });
+
+    const teacherSelect = document.createElement("select");
+    const pool = option.subject ? teachersForSubject(option.subject) : [];
+    populateOptions(teacherSelect, ["", ...pool.map((teacher) => teacher.id)], [option.teacherId || ""], (value) => {
+      if (!value) return "Any qualified teacher";
+      return state.teachers.find((teacher) => teacher.id === value)?.name || value;
+    });
+    teacherSelect.addEventListener("change", () => {
+      option.teacherId = teacherSelect.value;
+      saveToStorage();
+    });
+
+    const removeOption = document.createElement("button");
+    removeOption.type = "button";
+    removeOption.className = "ghost";
+    removeOption.textContent = "Remove";
+    removeOption.disabled = rule.options.length <= 2;
+    removeOption.addEventListener("click", () => {
+      rule.options.splice(index, 1);
+      renderAll();
+    });
+
+    optionRow.append(
+      fieldWrap(`Subject ${index + 1}`, subjectSelect),
+      fieldWrap("Teacher", teacherSelect),
+      removeOption,
+    );
+    optionsWrap.append(optionRow);
+  });
+  const addOption = document.createElement("button");
+  addOption.type = "button";
+  addOption.className = "secondary";
+  addOption.textContent = "Add Parallel Subject";
+  addOption.addEventListener("click", () => {
+    rule.options.push({ subject: "", teacherId: "" });
+    renderAll();
+  });
+  optionsWrap.append(addOption);
+  row.append(optionsWrap);
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "ghost remove-entity";
+  remove.textContent = "Remove Split";
+  remove.addEventListener("click", () => {
+    state.electiveRules = state.electiveRules.filter((item) => item.id !== rule.id);
+    renderAll();
+  });
+  row.append(remove);
+  return row;
 }
 
 function renderGroupingRuleEditor(rule) {
@@ -1330,7 +1727,7 @@ function populateOptions(select, values, selected = [], labeler = (value) => val
   });
 }
 
-function renderSlotGrid(container, matrix, days, slotCount, positiveDefault, onChange, onText = "On", offText = "Off") {
+function renderSlotGrid(container, matrix, days, slotCount, positiveDefault, onChange, onText = "On", offText = "Off", slotCountFor = null) {
   container.innerHTML = "";
   container.style.setProperty("--slot-count", slotCount);
   container.append(labelCell("Day"));
@@ -1339,7 +1736,14 @@ function renderSlotGrid(container, matrix, days, slotCount, positiveDefault, onC
   }
   days.forEach((day) => {
     container.append(labelCell(day.slice(0, 3)));
+    const dayCount = slotCountFor ? slotCountFor(day) : slotCount;
     for (let slot = 0; slot < slotCount; slot++) {
+      if (slot >= dayCount) {
+        const voidCell = labelCell("-");
+        voidCell.classList.add("void-slot");
+        container.append(voidCell);
+        continue;
+      }
       const value = matrix[day]?.[slot] ?? positiveDefault;
       const toggle = document.createElement("label");
       toggle.className = `slot-toggle ${value ? "on" : ""}`;
@@ -1412,6 +1816,10 @@ function sessionPatternFor(level, subjectName, total) {
 
 function groupingRuleById(id) {
   return (state.groupingRules || []).find((rule) => rule.id === id) || null;
+}
+
+function electiveRuleById(id) {
+  return (state.electiveRules || []).find((rule) => rule.id === id) || null;
 }
 
 function groupedRequirementClassIds(rule) {
@@ -1523,7 +1931,7 @@ function normalizeAvailability() {
     const next = {};
     level.days.forEach((day) => {
       const existing = klass.blocked[day] || [];
-      next[day] = Array.from({ length: level.periodsPerDay }, (_, index) => existing[index] ?? false);
+      next[day] = Array.from({ length: periodsForDay(level, day) }, (_, index) => existing[index] ?? false);
     });
     klass.blocked = next;
   });
@@ -1545,8 +1953,22 @@ function validateSetup() {
     if (!level.name.trim()) messages.push("Every level needs a name.");
     if (!level.days.length) messages.push(`${level.name} has no school days selected.`);
     if (timeToMinutes(level.endTime) <= timeToMinutes(level.startTime)) messages.push(`${level.name}: end time must be after start time.`);
-    const times = levelTimes(level);
-    if (!times.fits) messages.push(`${level.name}: ${level.periodsPerDay} periods do not fit between ${level.startTime} and ${level.endTime} even after shortening to ${MIN_PERIOD_LENGTH} minutes. Reduce periods or the break.`);
+    const baseChecked = { done: false };
+    level.days.forEach((day) => {
+      const hasOverride = Boolean(dayOverride(level, day));
+      if (!hasOverride && baseChecked.done) return;
+      if (!hasOverride) baseChecked.done = true;
+      const config = dayConfig(level, day);
+      const where = hasOverride ? `${level.name}, ${day}` : level.name;
+      if (timeToMinutes(config.endTime) <= timeToMinutes(config.startTime)) {
+        messages.push(`${where}: end time must be after start time.`);
+        return;
+      }
+      const times = levelTimes(level, day);
+      if (!times.fits) {
+        messages.push(`${where}: ${config.periodsPerDay} periods do not fit between ${config.startTime} and ${config.endTime} even after shortening to ${levelMinPeriod(level)} minutes. Reduce periods or the break.`);
+      }
+    });
   });
   if (!state.subjects.length) messages.push("Add at least one subject.");
   if (!state.teachers.length) messages.push("Add at least one teacher.");
@@ -1559,6 +1981,12 @@ function validateSetup() {
     if (!teacher.name.trim()) messages.push("Every teacher needs a name.");
     if (!teacher.subjects.length) messages.push(`${teacher.name || "A teacher"} has no teachable subjects selected.`);
   });
+  const electiveLoadByClass = {};
+  (state.electiveRules || []).forEach((rule) => {
+    (rule.classIds || []).forEach((classId) => {
+      electiveLoadByClass[classId] = (electiveLoadByClass[classId] || 0) + Number(rule.count || 0);
+    });
+  });
   state.classes.forEach((klass) => {
     if (!klass.name.trim()) messages.push("Every class needs a name.");
     const level = levelById(klass.levelId);
@@ -1566,8 +1994,8 @@ function validateSetup() {
       messages.push(`${klass.name} is not assigned to a level.`);
       return;
     }
-    const total = klass.requirements.reduce((sum, item) => sum + Number(item.count || 0), 0);
-    const capacity = level.days.length * level.periodsPerDay;
+    const total = klass.requirements.reduce((sum, item) => sum + Number(item.count || 0), 0) + (electiveLoadByClass[klass.id] || 0);
+    const capacity = level.days.reduce((sum, day) => sum + periodsForDay(level, day), 0);
     if (total > capacity) messages.push(`${klass.name} needs ${total} periods, but ${level.name} has capacity for ${capacity}.`);
     klass.requirements.filter((item) => item.count > 0).forEach((item) => {
       const subject = subjectByName(item.subject);
@@ -1601,6 +2029,39 @@ function validateSetup() {
       messages.push(`Grouping rule ${rule.groupName || rule.id} says ${rule.classCount} classes, but ${assignedCount} class requirements are attached.`);
     }
   });
+  (state.electiveRules || []).forEach((rule) => {
+    const label = rule.name || "Elective split";
+    const level = levelById(rule.levelId);
+    if (!level) {
+      messages.push(`${label}: pick a level.`);
+      return;
+    }
+    const options = (rule.options || []).filter((option) => option.subject);
+    if (options.length < 2) messages.push(`${label}: needs at least two parallel subjects (e.g. German and French).`);
+    if (!(rule.classIds || []).length) messages.push(`${label}: select the classes whose students split.`);
+    if (!(rule.count > 0)) messages.push(`${label}: set periods per week.`);
+    const optionSubjects = new Set();
+    options.forEach((option) => {
+      if (optionSubjects.has(option.subject)) messages.push(`${label}: ${option.subject} is listed twice.`);
+      optionSubjects.add(option.subject);
+      if (!subjectByName(option.subject)) messages.push(`${label} references a missing subject: ${option.subject}.`);
+      const pool = option.teacherId ? state.teachers.filter((teacher) => teacher.id === option.teacherId) : teachersForSubject(option.subject);
+      if (!pool.length) messages.push(`${label}: no teacher can teach ${option.subject}.`);
+    });
+    (rule.classIds || []).forEach((classId) => {
+      const klass = classById(classId);
+      if (!klass) return;
+      if (klass.levelId !== rule.levelId) messages.push(`${label}: ${klass.name} is not in ${level.name}.`);
+      klass.requirements.forEach((requirement) => {
+        if (Number(requirement.count || 0) > 0 && optionSubjects.has(requirement.subject)) {
+          messages.push(`${klass.name}: remove the separate ${requirement.subject} requirement (${requirement.count}/week) - it is already covered by the elective split "${label}".`);
+        }
+      });
+    });
+    if (rule.count > level.days.length * Math.max(1, state.settings.maxSubjectPerDay)) {
+      messages.push(`${label}: ${rule.count} periods per week do not fit within the daily repeat limit.`);
+    }
+  });
   return { ok: messages.length === 0, messages };
 }
 
@@ -1619,34 +2080,132 @@ function generateSchedules() {
     showValidation(validation.messages);
     return;
   }
+  // Solving is synchronous and can take a few seconds on hard setups; show a
+  // busy state and yield one frame so the label actually paints first.
+  els.generateBtn.disabled = true;
+  els.generateBtn.textContent = "Generating...";
+  showAlerts([{ type: "", text: "Searching for schedules. Hard setups can take a few seconds..." }]);
+  setTimeout(() => {
+    try {
+      runGeneration();
+    } finally {
+      els.generateBtn.disabled = false;
+      els.generateBtn.textContent = "Generate Schedules";
+    }
+  }, 30);
+}
+
+function runGeneration() {
   const schedules = buildCandidateSchedules();
   state.schedules = schedules;
   state.selectedSchedule = 0;
   renderSchedules();
   saveToStorage();
-  if (schedules.length) {
-    showAlerts([{ type: "success", text: `Generated ${schedules.length} candidate schedule${schedules.length === 1 ? "" : "s"}. Lower score is better. Use the section buttons on the left to keep editing the setup.` }]);
+  if (!schedules.length) {
+    showAlerts([{ type: "error", text: "No schedules could be generated. Add classes with weekly subject requirements first." }]);
+    return;
+  }
+  const best = schedules[0];
+  if (!best.violations?.length) {
+    showAlerts([{ type: "success", text: `Generated ${schedules.length} schedule${schedules.length === 1 ? "" : "s"} meeting every hard constraint. Lower score is better. Use the section buttons on the left to keep editing the setup.` }]);
   } else {
-    showAlerts([{ type: "error", text: "No valid schedules found. Try increasing teacher availability, reducing weekly periods, or loosening hard constraints." }]);
+    showAlerts([
+      { type: "error", text: `No timetable can satisfy every hard constraint with the current setup. Showing the ${schedules.length} closest schedule${schedules.length === 1 ? "" : "s"} instead - the best option breaks ${best.violations.length} constraint${best.violations.length === 1 ? "" : "s"}.` },
+      { type: "", text: "Each option lists exactly which constraints it breaks (above the timetable, and highlighted red on the affected lessons). Fix them by editing lessons manually, or loosen availability, loads, or requirements and regenerate." },
+    ]);
   }
 }
 
+const EXACT_TIME_BUDGET_MS = 4500;
+const RELAXED_TIME_BUDGET_MS = 3500;
+const EXACT_NODE_BUDGET_DEEP = 30000;
+
+// Two-phase generation. Phase 1 (exact): first fast greedy-with-slack probes
+// across many seeds, then deep backtracking search on a few seeds if the
+// probes found little; only schedules meeting every hard constraint are
+// accepted. Phase 2 (fallback, only when phase 1 finds nothing): every lesson
+// is placed at the spot breaking the fewest constraints, a repair pass
+// relocates offending lessons, and results are ranked by number of broken
+// constraints. Every schedule carries a `violations` list naming each break.
 function buildCandidateSchedules() {
-  const seedCount = Math.min(24, Math.max(8, state.settings.candidateLimit * 2));
-  const candidates = [];
-  for (let seed = 0; seed < seedCount; seed++) {
-    const tasks = expandTasks(seed);
+  const limit = state.settings.candidateLimit;
+  const seedCount = Math.min(24, Math.max(8, limit * 2));
+  const perfect = [];
+  const exactDeadline = Date.now() + EXACT_TIME_BUDGET_MS;
+  const solveSeed = (seed, nodes) => {
+    const tasks = orderTasks(expandTasks(seed), seed);
     const schedule = emptySchedule();
-    const ordered = shuffleWithSeed(tasks, seed).sort((a, b) => taskWeight(b) - taskWeight(a));
-    const result = placeTasks(schedule, ordered, seed);
-    if (result.ok) {
-      const score = scoreSchedule(schedule);
-      candidates.push({ ...schedule, score, seed });
+    const budget = { nodes: nodes ?? tasks.length + 60, used: 0, deadline: exactDeadline, exhausted: false };
+    if (placeTasksExact(schedule, tasks, seed, budget)) {
+      schedule.seed = seed;
+      refreshScheduleMeta(schedule);
+      perfect.push(schedule);
+    }
+  };
+  for (let seed = 0; seed < seedCount && Date.now() < exactDeadline; seed++) {
+    solveSeed(seed, null);
+  }
+  if (perfect.length < Math.min(3, limit)) {
+    for (let seed = 0; seed < Math.min(6, seedCount) && Date.now() < exactDeadline; seed++) {
+      solveSeed(seed, EXACT_NODE_BUDGET_DEEP);
     }
   }
-  return dedupeSchedules(candidates)
-    .sort((a, b) => a.score - b.score)
-    .slice(0, state.settings.candidateLimit);
+  if (perfect.length) {
+    return dedupeSchedules(perfect)
+      .sort((a, b) => (a.violations.length - b.violations.length) || (a.score - b.score))
+      .slice(0, limit);
+  }
+  const relaxed = [];
+  const relaxedDeadline = Date.now() + RELAXED_TIME_BUDGET_MS;
+  for (let seed = 0; seed < seedCount; seed++) {
+    const tasks = orderTasks(expandTasks(seed), seed);
+    const schedule = emptySchedule();
+    placeTasksRelaxed(schedule, tasks, seed);
+    repairSchedule(schedule, seed);
+    schedule.seed = seed;
+    refreshScheduleMeta(schedule);
+    relaxed.push(schedule);
+    if (Date.now() > relaxedDeadline && relaxed.length >= Math.min(4, limit)) break;
+  }
+  return dedupeSchedules(relaxed)
+    .sort((a, b) => (a.violations.length - b.violations.length) || (a.violationWeight - b.violationWeight) || (a.score - b.score))
+    .slice(0, limit);
+}
+
+// Most-constrained-first ordering: subjects whose weekly demand nearly
+// exhausts their teachers' capacity are placed before loosely-supplied ones,
+// then longer blocks and harder subjects. This is what lets tight instances
+// (e.g. a subject using 85 of 90 teacher slots) solve without deep search.
+function orderTasks(tasks, seed) {
+  const tightness = subjectTightnessMap();
+  // Elective splits need several teachers plus every listed class free at the
+  // same time, so they are the most constrained tasks and go first.
+  const weightOf = (task) => taskWeight(task) + (tightness[task.subject] || 0) + (task.electiveOptions ? 700 : 0);
+  return shuffleWithSeed(tasks, seed).sort((a, b) => weightOf(b) - weightOf(a));
+}
+
+function subjectTightnessMap() {
+  const demand = {};
+  state.classes.forEach((klass) => klass.requirements.forEach((requirement) => {
+    const expected = expectedWeeklyCount(requirement);
+    if (expected > 0) demand[requirement.subject] = (demand[requirement.subject] || 0) + expected;
+  }));
+  (state.electiveRules || []).forEach((rule) => {
+    (rule.options || []).forEach((option) => {
+      if (option.subject && rule.count > 0) demand[option.subject] = (demand[option.subject] || 0) + Number(rule.count);
+    });
+  });
+  const days = unionDays().length;
+  const map = {};
+  Object.keys(demand).forEach((subject) => {
+    const supply = teachersForSubject(subject).reduce((sum, teacher) => {
+      const share = Math.max(1, teacher.subjects.length);
+      return sum + (days * (teacher.maxPerDay || state.settings.maxTeacherPerDay)) / share;
+    }, 0);
+    const ratio = supply > 0 ? demand[subject] / supply : 2;
+    map[subject] = ratio * 400;
+  });
+  return map;
 }
 
 function expandTasks(seed = 0) {
@@ -1680,6 +2239,31 @@ function expandTasks(seed = 0) {
     chunks.forEach((chunk, index) => {
       appendRequirementTasks(tasks, entry.level, entry.requirement, chunk, entry.teacherId, entry.rule, index + 1);
     });
+  });
+  (state.electiveRules || []).forEach((rule) => {
+    const level = levelById(rule.levelId);
+    const classIds = (rule.classIds || []).filter((id) => classById(id));
+    const options = (rule.options || []).filter((option) => option.subject);
+    if (!level || !classIds.length || !options.length || !(rule.count > 0)) return;
+    const classNames = classNamesForIds(classIds);
+    for (let occurrence = 1; occurrence <= rule.count; occurrence++) {
+      tasks.push({
+        classId: classIds[0],
+        classIds,
+        className: classNames.join(" + "),
+        classNames,
+        levelId: level.id,
+        subject: options.map((option) => option.subject).join(" / "),
+        electiveOptions: options.map((option) => ({ subject: option.subject, teacherId: option.teacherId || "" })),
+        electiveRuleId: rule.id,
+        teacherId: "",
+        possiblyLate: false,
+        length: 1,
+        occurrence,
+        groupRuleId: "",
+        teachingGroupIndex: 0,
+      });
+    }
   });
   return tasks;
 }
@@ -1718,7 +2302,7 @@ function emptySchedule() {
     const level = levelById(klass.levelId);
     byClass[klass.id] = {};
     (level?.days || []).forEach((day) => {
-      byClass[klass.id][day] = Array.from({ length: level.periodsPerDay }, () => null);
+      byClass[klass.id][day] = Array.from({ length: periodsForDay(level, day) }, () => null);
     });
   });
   state.teachers.forEach((teacher) => {
@@ -1730,65 +2314,226 @@ function emptySchedule() {
   return { byClass, teacherSlots };
 }
 
-function placeTasks(schedule, tasks, seed) {
-  for (const task of tasks) {
-    const placements = validPlacements(schedule, task)
+// Depth-first search with backtracking. Placements are tried best-score
+// first and unwound on dead ends, so within its node/time budget the search
+// is exact: if any complete schedule exists for this task order, it is found.
+// Multiple seeds retry with different task orders and score noise.
+function placeTasksExact(schedule, tasks, seed, budget) {
+  function place(index) {
+    if (index >= tasks.length) return true;
+    if (budget.used > budget.nodes || Date.now() > budget.deadline) {
+      budget.exhausted = true;
+      return false;
+    }
+    const task = tasks[index];
+    const placements = enumeratePlacements(schedule, task, false)
       .map((placement) => ({ ...placement, score: placementScore(schedule, task, placement, seed) }))
       .sort((a, b) => a.score - b.score);
-    if (!placements.length) return { ok: false };
-    const chosen = placements[Math.min(placements.length - 1, seededInt(seed + task.occurrence, Math.min(3, placements.length)))];
-    applyTask(schedule, task, chosen);
+    for (const placement of placements) {
+      budget.used += 1;
+      const applied = applyTask(schedule, task, placement);
+      if (place(index + 1)) return true;
+      undoTask(schedule, applied);
+      if (budget.exhausted) return false;
+    }
+    return false;
   }
-  return { ok: true };
+  return place(0);
 }
 
-function validPlacements(schedule, task) {
+// Fallback placement: every task lands on the spot that breaks the fewest
+// (lowest-weight) constraints. Structural rules (one lesson per class slot,
+// block shapes, break straddling, day length) are never broken. Tasks with no
+// physically possible spot stay unplaced and are reported by the audit.
+function placeTasksRelaxed(schedule, tasks, seed) {
+  const unplaced = [];
+  tasks.forEach((task) => {
+    const placements = enumeratePlacements(schedule, task, true)
+      .map((placement) => ({ ...placement, score: placementScore(schedule, task, placement, seed) }))
+      .sort((a, b) => (a.penalty - b.penalty) || (a.score - b.score));
+    if (!placements.length) {
+      unplaced.push(task);
+      return;
+    }
+    const bestPenalty = placements[0].penalty;
+    const pool = placements.filter((placement) => placement.penalty === bestPenalty).slice(0, 3);
+    applyTask(schedule, task, pool[seededInt(seed + task.occurrence, pool.length)]);
+  });
+  return unplaced;
+}
+
+// All placements for a task. In exact mode only conflict-free placements are
+// returned. In relaxed mode, placements that break relaxable constraints are
+// returned too, each carrying the violations it would cause and a penalty.
+function enumeratePlacements(schedule, task, relaxed = false) {
+  if (task.electiveOptions?.length) return enumerateElectivePlacements(schedule, task, relaxed);
   const placements = [];
   const classes = (task.classIds?.length ? task.classIds : [task.classId]).map(classById).filter(Boolean);
   const level = levelById(task.levelId);
   if (!classes.length || !level) return placements;
-  const teachers = task.teacherId ? state.teachers.filter((teacher) => teacher.id === task.teacherId) : teachersForSubject(task.subject);
+  let teachers;
+  if (task.teacherId) {
+    teachers = state.teachers.filter((teacher) => teacher.id === task.teacherId);
+  } else {
+    teachers = teachersForSubject(task.subject);
+    if (!teachers.length && relaxed) teachers = state.teachers;
+  }
+  const patternLocked = Boolean(level.sessionPatterns?.[task.subject]?.length);
   level.days.forEach((day) => {
-    const classDays = classes.map((item) => ({ klass: item, grid: schedule.byClass[item.id]?.[day] }));
+    const config = dayConfig(level, day);
+    const breakAt = effectiveBreakLength(config) ? config.breakAfter : 0;
+    const classDays = classes.map((klass) => ({ klass, grid: schedule.byClass[klass.id]?.[day] }));
     if (classDays.some((item) => !item.grid)) return;
-    if (classDays.some((item) => item.grid.filter((lesson) => lesson?.subject === task.subject).length + task.length > allowedSubjectPerDay(level, task.subject))) return;
-    for (let slot = 0; slot + task.length <= level.periodsPerDay; slot++) {
-      if (level.breakAfter > 0 && slot < level.breakAfter && slot + task.length > level.breakAfter) continue;
-      let free = true;
-      for (let index = 0; index < task.length; index++) {
-        if (classDays.some(({ klass: item, grid }) => grid[slot + index] || item.blocked[day]?.[slot + index])) {
-          free = false;
+    const repeatCount = Math.max(...classDays.map(({ grid }) => grid.filter((lesson) => lesson?.subject === task.subject).length));
+    const repeatBroken = repeatCount + task.length > allowedSubjectPerDay(level, task.subject);
+    if (repeatBroken && !relaxed) return;
+    for (let slot = 0; slot + task.length <= config.periodsPerDay; slot++) {
+      if (breakAt > 0 && slot < breakAt && slot + task.length > breakAt) continue;
+      let occupied = false;
+      const blockedSlots = [];
+      for (let index = 0; index < task.length && !occupied; index++) {
+        const at = slot + index;
+        for (const { klass, grid } of classDays) {
+          if (grid[at]) {
+            occupied = true;
+            break;
+          }
+          if (klass.blocked[day]?.[at]) blockedSlots.push({ klass, at });
+        }
+      }
+      if (occupied) continue;
+      if (blockedSlots.length && !relaxed) continue;
+      if (patternLocked && classDays.some(({ grid }) => grid[slot - 1]?.subject === task.subject || grid[slot + task.length]?.subject === task.subject)) continue;
+      for (const teacher of teachers) {
+        const placement = evaluateTeacherPlacement(schedule, task, teacher, day, slot, relaxed, repeatBroken, blockedSlots);
+        if (placement) placements.push(placement);
+      }
+    }
+  });
+  return placements;
+}
+
+function evaluateTeacherPlacement(schedule, task, teacher, day, slot, relaxed, repeatBroken, blockedSlots) {
+  const violations = [];
+  if (state.constraints.requireQualifiedTeacher && !teacher.subjects.includes(task.subject)) {
+    if (!relaxed) return null;
+    violations.push(violation("unqualified", `${teacher.name} is not qualified to teach ${task.subject}.`));
+  }
+  const teacherDay = schedule.teacherSlots[teacher.id]?.[day];
+  if (!teacherDay) return null;
+  const replacements = task.possiblyLate ? replacementTeachersFor(teacher.id) : [];
+  if (task.possiblyLate && !replacements.length) {
+    if (!relaxed) return null;
+    violations.push(violation("lateCover", `${teacher.name} has no replacement teacher for a possibly-late lesson.`));
+  }
+  if (repeatBroken) violations.push(violation("repeat", `${task.subject} repeated beyond the daily limit for ${task.className} on ${day}.`));
+  blockedSlots.forEach(({ klass, at }) => violations.push(violation("blocked", `${klass.name} is blocked on ${day} P${at + 1}.`)));
+  for (let index = 0; index < task.length; index++) {
+    const at = slot + index;
+    if (state.constraints.honorAvailability && teacher.availability[day]?.[at] === false) {
+      if (!relaxed) return null;
+      violations.push(violation("availability", `${teacher.name} is unavailable on ${day} P${at + 1}.`));
+    }
+    if (state.constraints.preventTeacherClashes && teacherDay[at]) {
+      if (!relaxed) return null;
+      violations.push(violation("clash", `${teacher.name} is double-booked on ${day} P${at + 1}.`));
+    }
+    for (const replacement of replacements) {
+      if (state.constraints.honorAvailability && replacement.availability[day]?.[at] === false) {
+        if (!relaxed) return null;
+        violations.push(violation("lateCover", `${replacement.name} is unavailable to cover ${teacher.name} on ${day} P${at + 1}.`));
+      }
+      if (state.constraints.preventTeacherClashes && schedule.teacherSlots[replacement.id]?.[day]?.[at]) {
+        if (!relaxed) return null;
+        violations.push(violation("lateCover", `${replacement.name} is occupied and cannot cover ${teacher.name} on ${day} P${at + 1}.`));
+      }
+    }
+  }
+  const maxTeacher = teacher.maxPerDay || state.settings.maxTeacherPerDay;
+  if (teacherDay.filter(Boolean).length + task.length > maxTeacher) {
+    if (!relaxed) return null;
+    violations.push(violation("overload", `${teacher.name} exceeds ${maxTeacher} periods on ${day}.`));
+  }
+  if (!relaxed) {
+    for (const replacement of replacements) {
+      const replacementDay = schedule.teacherSlots[replacement.id]?.[day] || [];
+      if (replacementDay.filter(Boolean).length + task.length > (replacement.maxPerDay || state.settings.maxTeacherPerDay)) return null;
+    }
+  }
+  return {
+    day,
+    slot,
+    teacherId: teacher.id,
+    violations,
+    penalty: violations.reduce((sum, item) => sum + item.weight, 0),
+  };
+}
+
+// Placements for an elective split: all listed classes must be free at the
+// slot, and every option (e.g. German AND French) needs its own free teacher
+// at the same time. For each option the least-loaded viable teacher is
+// chosen; distinct teachers are enforced across options.
+function enumerateElectivePlacements(schedule, task, relaxed = false) {
+  const placements = [];
+  const classes = (task.classIds || []).map(classById).filter(Boolean);
+  const level = levelById(task.levelId);
+  if (!classes.length || !level) return placements;
+  const dailyLimit = Math.max(1, state.settings.maxSubjectPerDay);
+  level.days.forEach((day) => {
+    const config = dayConfig(level, day);
+    const classDays = classes.map((klass) => ({ klass, grid: schedule.byClass[klass.id]?.[day] }));
+    if (classDays.some((item) => !item.grid)) return;
+    const repeatCount = Math.max(...classDays.map(({ grid }) => grid.filter((lesson) => lesson?.electiveRuleId === task.electiveRuleId).length));
+    const repeatBroken = repeatCount + 1 > dailyLimit;
+    if (repeatBroken && !relaxed) return;
+    for (let slot = 0; slot < config.periodsPerDay; slot++) {
+      let occupied = false;
+      const blockedSlots = [];
+      for (const { klass, grid } of classDays) {
+        if (grid[slot]) {
+          occupied = true;
           break;
         }
+        if (klass.blocked[day]?.[slot]) blockedSlots.push({ klass, at: slot });
       }
-      if (free && level.sessionPatterns?.[task.subject]?.length) {
-        if (classDays.some(({ grid }) => grid[slot - 1]?.subject === task.subject || grid[slot + task.length]?.subject === task.subject)) {
-          free = false;
+      if (occupied) continue;
+      if (blockedSlots.length && !relaxed) continue;
+      const violations = [];
+      if (repeatBroken) violations.push(violation("repeat", `${task.subject} repeated beyond the daily limit for ${task.className} on ${day}.`));
+      blockedSlots.forEach(({ klass, at }) => violations.push(violation("blocked", `${klass.name} is blocked on ${day} P${at + 1}.`)));
+      const optionTeachers = [];
+      const used = new Set();
+      let feasible = true;
+      for (const option of task.electiveOptions) {
+        let pool = (option.teacherId
+          ? state.teachers.filter((teacher) => teacher.id === option.teacherId)
+          : teachersForSubject(option.subject)).filter((teacher) => !used.has(teacher.id));
+        if (!pool.length && relaxed) pool = state.teachers.filter((teacher) => !used.has(teacher.id));
+        const optionTask = { subject: option.subject, className: task.className, length: 1, possiblyLate: false, teacherId: option.teacherId || "" };
+        let best = null;
+        for (const teacher of pool) {
+          const evaluated = evaluateTeacherPlacement(schedule, optionTask, teacher, day, slot, relaxed, false, []);
+          if (!evaluated) continue;
+          const load = (schedule.teacherSlots[teacher.id]?.[day] || []).filter(Boolean).length;
+          const rank = evaluated.penalty * 1000 + load;
+          if (!best || rank < best.rank) best = { teacher, evaluated, rank };
         }
+        if (!best) {
+          feasible = false;
+          break;
+        }
+        used.add(best.teacher.id);
+        optionTeachers.push({ subject: option.subject, teacherId: best.teacher.id });
+        violations.push(...best.evaluated.violations);
       }
-      if (!free) continue;
-      teachers.forEach((teacher) => {
-        if (state.constraints.requireQualifiedTeacher && !teacher.subjects.includes(task.subject)) return;
-        const teacherDay = schedule.teacherSlots[teacher.id][day];
-        if (!teacherDay) return;
-        const replacements = task.possiblyLate ? replacementTeachersFor(teacher.id) : [];
-        if (task.possiblyLate && !replacements.length) return;
-        for (let index = 0; index < task.length; index++) {
-          const at = slot + index;
-          if (state.constraints.honorAvailability && teacher.availability[day]?.[at] === false) return;
-          if (state.constraints.preventTeacherClashes && teacherDay[at]) return;
-          for (const replacement of replacements) {
-            if (state.constraints.honorAvailability && replacement.availability[day]?.[at] === false) return;
-            if (state.constraints.preventTeacherClashes && schedule.teacherSlots[replacement.id][day]?.[at]) return;
-          }
-        }
-        const maxTeacher = teacher.maxPerDay || state.settings.maxTeacherPerDay;
-        if (teacherDay.filter(Boolean).length + task.length > maxTeacher) return;
-        for (const replacement of replacements) {
-          const replacementDay = schedule.teacherSlots[replacement.id][day] || [];
-          if (replacementDay.filter(Boolean).length + task.length > (replacement.maxPerDay || state.settings.maxTeacherPerDay)) return;
-        }
-        placements.push({ day, slot, teacherId: teacher.id });
+      if (!feasible) continue;
+      placements.push({
+        day,
+        slot,
+        teacherId: optionTeachers[0].teacherId,
+        optionTeachers,
+        violations,
+        penalty: violations.reduce((sum, item) => sum + item.weight, 0),
       });
     }
   });
@@ -1827,10 +2572,12 @@ function placementScore(schedule, task, placement, seed) {
 }
 
 function applyTask(schedule, task, placement) {
+  if (task.electiveOptions?.length) return applyElectiveTask(schedule, task, placement);
   const teacher = state.teachers.find((item) => item.id === placement.teacherId);
   const subject = subjectByName(task.subject);
   const replacements = task.possiblyLate ? replacementTeachersFor(placement.teacherId) : [];
   const groupId = task.groupRuleId ? `${task.groupRuleId}_${task.teachingGroupIndex || 1}_${task.occurrence}` : task.length > 1 ? uid("blk") : "";
+  const records = [];
   for (let index = 0; index < task.length; index++) {
     const lesson = {
       id: uid("les"),
@@ -1842,6 +2589,7 @@ function applyTask(schedule, task, placement) {
       subject: task.subject,
       teacherId: placement.teacherId,
       teacherName: teacher?.name || "",
+      requiredTeacherId: task.teacherId || "",
       replacementIds: replacements.map((item) => item.id),
       replacementNames: replacements.map((item) => item.name),
       possiblyLate: Boolean(task.possiblyLate),
@@ -1851,7 +2599,64 @@ function applyTask(schedule, task, placement) {
       teachingGroupIndex: task.teachingGroupIndex || 0,
     };
     commitLesson(schedule, lesson, placement.day, placement.slot + index);
+    records.push({ day: placement.day, slot: placement.slot + index, lesson });
   }
+  return records;
+}
+
+// One combined lesson per occurrence of an elective split. The class grids
+// hold the combined "German / French" lesson; each option's teacher gets a
+// per-subject copy in their own grid (written by commitLesson via `parts`).
+function applyElectiveTask(schedule, task, placement) {
+  const parts = placement.optionTeachers.map(({ subject, teacherId }) => {
+    const teacher = state.teachers.find((item) => item.id === teacherId);
+    const subjectDef = subjectByName(subject);
+    return { subject, teacherId, teacherName: teacher?.name || "", color: subjectDef?.color || "#4a5568" };
+  });
+  const lesson = {
+    id: uid("les"),
+    groupId: `${task.electiveRuleId}_${task.occurrence}`,
+    classId: task.classId,
+    classIds: task.classIds,
+    className: task.className,
+    classNames: task.classNames,
+    subject: parts.map((part) => part.subject).join(" / "),
+    parts,
+    teacherId: parts[0].teacherId,
+    teacherName: parts.map((part) => `${part.teacherName} (${part.subject})`).join(", "),
+    requiredTeacherId: "",
+    replacementIds: [],
+    replacementNames: [],
+    possiblyLate: false,
+    color: parts[0].color,
+    note: "",
+    groupRuleId: "",
+    teachingGroupIndex: 0,
+    electiveRuleId: task.electiveRuleId,
+  };
+  commitLesson(schedule, lesson, placement.day, placement.slot);
+  return [{ day: placement.day, slot: placement.slot, lesson }];
+}
+
+function lessonTeacherIds(lesson) {
+  return lesson.parts?.length ? lesson.parts.map((part) => part.teacherId) : [lesson.teacherId];
+}
+
+function undoTask(schedule, records) {
+  records.forEach(({ day, slot, lesson }) => {
+    (lesson.classIds?.length ? lesson.classIds : [lesson.classId]).forEach((classId) => {
+      const grid = schedule.byClass[classId]?.[day];
+      if (grid && grid[slot]?.id === lesson.id) grid[slot] = null;
+    });
+    lessonTeacherIds(lesson).forEach((teacherId) => {
+      const teacherDay = schedule.teacherSlots[teacherId]?.[day];
+      if (teacherDay && teacherDay[slot]?.id === lesson.id) teacherDay[slot] = null;
+    });
+    (lesson.replacementIds || []).forEach((replacementId) => {
+      const replacementDay = schedule.teacherSlots[replacementId]?.[day];
+      if (replacementDay && replacementDay[slot]?.id === lesson.id) replacementDay[slot] = null;
+    });
+  });
 }
 
 function commitLesson(schedule, lesson, day, slot) {
@@ -1872,11 +2677,24 @@ function commitLesson(schedule, lesson, day, slot) {
       className: classById(classId)?.name || teacherLesson.className,
     };
   });
-  schedule.teacherSlots[lesson.teacherId][day][slot] = teacherLesson;
+  // Keep-first: in relaxed schedules a teacher can be double-booked; the
+  // class grids hold both lessons while the teacher grid shows the first.
+  if (lesson.parts?.length) {
+    lesson.parts.forEach((part) => {
+      const partDay = schedule.teacherSlots[part.teacherId]?.[day];
+      if (partDay && !partDay[slot]) {
+        partDay[slot] = { ...teacherLesson, subject: part.subject, teacherId: part.teacherId, teacherName: part.teacherName, color: part.color };
+      }
+    });
+    return;
+  }
+  const teacherDay = schedule.teacherSlots[lesson.teacherId]?.[day];
+  if (teacherDay && !teacherDay[slot]) teacherDay[slot] = teacherLesson;
   (lesson.replacementIds || []).forEach((replacementId) => {
-    if (!schedule.teacherSlots[replacementId]) return;
+    const replacementDay = schedule.teacherSlots[replacementId]?.[day];
+    if (!replacementDay || replacementDay[slot]) return;
     const replacement = state.teachers.find((teacher) => teacher.id === replacementId);
-    schedule.teacherSlots[replacementId][day][slot] = {
+    replacementDay[slot] = {
       ...teacherLesson,
       teacherId: replacementId,
       teacherName: replacement?.name || lesson.teacherName,
@@ -1932,6 +2750,361 @@ function dedupeSchedules(schedules) {
 }
 
 // ---------------------------------------------------------------------------
+// Constraint audit. computeScheduleViolations is the single source of truth
+// for what a finished schedule breaks; the solver's per-placement penalties
+// only guide the search. Weights rank fallback schedules (count first, then
+// total weight), and each violation names the exact broken constraint.
+// ---------------------------------------------------------------------------
+
+const VIOLATION_WEIGHTS = {
+  missing: 60,
+  clash: 50,
+  unqualified: 40,
+  extra: 30,
+  availability: 14,
+  blocked: 12,
+  overload: 10,
+  repeat: 8,
+  lateCover: 6,
+};
+
+const VIOLATION_LABELS = {
+  missing: "Unplaced lessons",
+  clash: "Teacher double-booked",
+  unqualified: "Unqualified teacher",
+  extra: "Extra lessons",
+  availability: "Teacher availability broken",
+  blocked: "Blocked class slot used",
+  overload: "Daily teacher load exceeded",
+  repeat: "Subject repeat limit exceeded",
+  lateCover: "Late cover not guaranteed",
+};
+
+function violation(type, text, lessonIds = []) {
+  return { type, text, weight: VIOLATION_WEIGHTS[type] || 5, lessonIds };
+}
+
+function expectedWeeklyCount(requirement) {
+  if (Number(requirement.count || 0) <= 0) return 0;
+  const rule = requirement.groupRuleId ? groupingRuleById(requirement.groupRuleId) : null;
+  if (rule && rule.mode !== "none") return Number(rule.periodsPerGroup || requirement.count || 0);
+  return Number(requirement.count || 0);
+}
+
+function computeScheduleViolations(schedule) {
+  const items = [];
+  const teacherLoad = new Map();
+  const distinctLessons = [];
+  const seenLessons = new Set();
+
+  state.classes.forEach((klass) => {
+    const level = levelById(klass.levelId);
+    if (!level) return;
+    const grid = schedule.byClass[klass.id] || {};
+    const weeklyCounts = {};
+    level.days.forEach((day) => {
+      const dailyBySubject = {};
+      (grid[day] || []).forEach((lesson, slot) => {
+        if (!lesson) return;
+        weeklyCounts[lesson.subject] = (weeklyCounts[lesson.subject] || 0) + 1;
+        (dailyBySubject[lesson.subject] ||= []).push(lesson.id);
+        if (klass.blocked[day]?.[slot]) {
+          items.push(violation("blocked", `${klass.name}: ${lesson.subject} is placed in a blocked slot (${day} P${slot + 1}).`, [lesson.id]));
+        }
+        if (!seenLessons.has(lesson.id)) {
+          seenLessons.add(lesson.id);
+          distinctLessons.push({ lesson, day, slot });
+          // An elective split is one lesson for the class but a separate
+          // teaching duty (own subject) for each option's teacher.
+          const duties = lesson.parts?.length
+            ? lesson.parts.map((part) => ({ ...lesson, subject: part.subject, teacherId: part.teacherId, teacherName: part.teacherName }))
+            : [lesson];
+          duties.forEach((duty) => {
+            if (!duty.teacherId) return;
+            if (!teacherLoad.has(duty.teacherId)) teacherLoad.set(duty.teacherId, new Map());
+            const byDay = teacherLoad.get(duty.teacherId);
+            if (!byDay.has(day)) byDay.set(day, new Map());
+            const bySlot = byDay.get(day);
+            if (!bySlot.has(slot)) bySlot.set(slot, []);
+            bySlot.get(slot).push(duty);
+          });
+        }
+      });
+      Object.entries(dailyBySubject).forEach(([subjectName, ids]) => {
+        const allowed = allowedSubjectPerDay(level, subjectName);
+        if (ids.length > allowed) {
+          items.push(violation("repeat", `${klass.name}: ${subjectName} appears ${ids.length} times on ${day} (limit ${allowed}).`, ids));
+        }
+      });
+    });
+    klass.requirements.forEach((requirement) => {
+      const expected = expectedWeeklyCount(requirement);
+      if (!expected) return;
+      const actual = weeklyCounts[requirement.subject] || 0;
+      if (actual < expected) {
+        items.push(violation("missing", `${klass.name}: only ${actual} of ${expected} weekly ${requirement.subject} period${expected === 1 ? "" : "s"} could be placed.`));
+      }
+      if (actual > expected) {
+        items.push(violation("extra", `${klass.name}: ${requirement.subject} is scheduled ${actual} times but only ${expected} are required.`));
+      }
+    });
+  });
+
+  (state.electiveRules || []).forEach((rule) => {
+    const level = levelById(rule.levelId);
+    if (!level || !(rule.count > 0)) return;
+    const label = rule.name || (rule.options || []).map((option) => option.subject).filter(Boolean).join(" / ") || "elective split";
+    (rule.classIds || []).forEach((classId) => {
+      const klass = classById(classId);
+      if (!klass) return;
+      const grid = schedule.byClass[classId] || {};
+      let actual = 0;
+      level.days.forEach((day) => (grid[day] || []).forEach((lesson) => {
+        if (lesson?.electiveRuleId === rule.id) actual += 1;
+      }));
+      if (actual < rule.count) {
+        items.push(violation("missing", `${klass.name}: only ${actual} of ${rule.count} weekly "${label}" period${rule.count === 1 ? "" : "s"} could be placed.`));
+      }
+      if (actual > rule.count) {
+        items.push(violation("extra", `${klass.name}: "${label}" is scheduled ${actual} times but only ${rule.count} are required.`));
+      }
+    });
+  });
+
+  teacherLoad.forEach((byDay, teacherId) => {
+    const teacher = state.teachers.find((item) => item.id === teacherId);
+    if (!teacher) return;
+    const maxTeacher = teacher.maxPerDay || state.settings.maxTeacherPerDay;
+    byDay.forEach((bySlot, day) => {
+      let dayCount = 0;
+      bySlot.forEach((lessons, slot) => {
+        dayCount += 1;
+        if (state.constraints.preventTeacherClashes && lessons.length > 1) {
+          const names = lessons.map((lesson) => lesson.className).join(" and ");
+          items.push(violation("clash", `${teacher.name} is double-booked on ${day} P${slot + 1} (${names}).`, lessons.map((lesson) => lesson.id)));
+        }
+        if (state.constraints.honorAvailability && teacher.availability[day]?.[slot] === false) {
+          items.push(violation("availability", `${teacher.name} teaches ${day} P${slot + 1} while marked unavailable.`, lessons.map((lesson) => lesson.id)));
+        }
+        if (state.constraints.requireQualifiedTeacher) {
+          lessons.forEach((lesson) => {
+            if (!teacher.subjects.includes(lesson.subject)) {
+              items.push(violation("unqualified", `${teacher.name} is not qualified to teach ${lesson.subject} (${lesson.className}, ${day} P${slot + 1}).`, [lesson.id]));
+            }
+          });
+        }
+      });
+      if (dayCount > maxTeacher) {
+        items.push(violation("overload", `${teacher.name} teaches ${dayCount} periods on ${day} (daily limit ${maxTeacher}).`));
+      }
+    });
+  });
+
+  distinctLessons.forEach(({ lesson, day, slot }) => {
+    if (!lesson.possiblyLate) return;
+    const replacements = replacementTeachersFor(lesson.teacherId);
+    if (!replacements.length) {
+      items.push(violation("lateCover", `${lesson.teacherName} (${lesson.subject}, ${lesson.className}, ${day} P${slot + 1}) is marked possibly late but has no replacement teachers.`, [lesson.id]));
+      return;
+    }
+    const free = replacements.filter((replacement) => {
+      if (state.constraints.honorAvailability && replacement.availability[day]?.[slot] === false) return false;
+      const busy = teacherLoad.get(replacement.id)?.get(day)?.get(slot);
+      return !(state.constraints.preventTeacherClashes && busy?.length);
+    });
+    if (!free.length) {
+      items.push(violation("lateCover", `No replacement is free to cover ${lesson.teacherName} (${lesson.subject}, ${lesson.className}, ${day} P${slot + 1}).`, [lesson.id]));
+    }
+  });
+
+  return items.sort((a, b) => (b.weight - a.weight) || a.text.localeCompare(b.text));
+}
+
+// Rebuilds the teacher-axis grids from the class grids (the source of truth).
+// Real lessons are placed first, then late-cover reservations, so a
+// reservation can never hide a teacher's actual lesson.
+function rebuildTeacherSlots(schedule) {
+  const slots = {};
+  state.teachers.forEach((teacher) => {
+    slots[teacher.id] = {};
+    unionDays().forEach((day) => {
+      slots[teacher.id][day] = Array.from({ length: maxSlots() }, () => null);
+    });
+  });
+  const seen = new Set();
+  const lessons = [];
+  state.classes.forEach((klass) => {
+    const grid = schedule.byClass[klass.id] || {};
+    Object.keys(grid).forEach((day) => {
+      grid[day].forEach((lesson, slot) => {
+        if (!lesson || seen.has(lesson.id)) return;
+        seen.add(lesson.id);
+        lessons.push({ lesson, day, slot });
+      });
+    });
+  });
+  lessons.forEach(({ lesson, day, slot }) => {
+    const classIds = lesson.classIds?.length ? lesson.classIds : [lesson.classId];
+    const classNames = classNamesForIds(classIds);
+    const teacherLesson = { ...lesson, classId: classIds[0], classIds, className: classNames.join(" + "), classNames };
+    if (lesson.parts?.length) {
+      lesson.parts.forEach((part) => {
+        const partDay = slots[part.teacherId]?.[day];
+        if (partDay && !partDay[slot]) {
+          partDay[slot] = { ...teacherLesson, subject: part.subject, teacherId: part.teacherId, teacherName: part.teacherName, color: part.color };
+        }
+      });
+      return;
+    }
+    const teacherDay = slots[lesson.teacherId]?.[day];
+    if (teacherDay && !teacherDay[slot]) teacherDay[slot] = teacherLesson;
+  });
+  lessons.forEach(({ lesson, day, slot }) => {
+    if (!lesson.possiblyLate) return;
+    const classIds = lesson.classIds?.length ? lesson.classIds : [lesson.classId];
+    const classNames = classNamesForIds(classIds);
+    (lesson.replacementIds || []).forEach((replacementId) => {
+      const replacementDay = slots[replacementId]?.[day];
+      if (!replacementDay || replacementDay[slot]) return;
+      const replacement = state.teachers.find((teacher) => teacher.id === replacementId);
+      replacementDay[slot] = {
+        ...lesson,
+        classId: classIds[0],
+        classIds,
+        className: classNames.join(" + "),
+        classNames,
+        teacherId: replacementId,
+        teacherName: replacement?.name || lesson.teacherName,
+        replacementForId: lesson.teacherId,
+        replacementForName: lesson.teacherName,
+      };
+    });
+  });
+  schedule.teacherSlots = slots;
+}
+
+function annotateLessonViolations(schedule) {
+  const byLesson = new Map();
+  (schedule.violations || []).forEach((item) => {
+    (item.lessonIds || []).forEach((id) => {
+      if (!byLesson.has(id)) byLesson.set(id, []);
+      byLesson.get(id).push(item.text);
+    });
+  });
+  const annotate = (lesson) => {
+    if (!lesson) return;
+    const texts = byLesson.get(lesson.id);
+    if (texts?.length) {
+      lesson.violations = texts;
+    } else {
+      delete lesson.violations;
+    }
+  };
+  Object.values(schedule.byClass || {}).forEach((dayGrid) => {
+    Object.keys(dayGrid).forEach((day) => dayGrid[day].forEach(annotate));
+  });
+  Object.values(schedule.teacherSlots || {}).forEach((dayGrid) => {
+    Object.keys(dayGrid).forEach((day) => dayGrid[day].forEach(annotate));
+  });
+}
+
+// Recomputes everything derived from the class grids: teacher grids, score,
+// broken-constraint list, and per-lesson highlights. Called after solving and
+// after every manual edit.
+function refreshScheduleMeta(schedule) {
+  rebuildTeacherSlots(schedule);
+  schedule.score = scoreSchedule(schedule);
+  schedule.violations = computeScheduleViolations(schedule);
+  schedule.violationWeight = schedule.violations.reduce((sum, item) => sum + item.weight, 0);
+  annotateLessonViolations(schedule);
+  return schedule;
+}
+
+// Local repair for fallback schedules: single-period lessons involved in
+// broken constraints are moved to conflict-free spots, keeping a move only if
+// it reduces the schedule's total violation weight. Monotone, so it can only
+// improve the schedule.
+let relocationCounter = 0;
+
+function violationTotal(items) {
+  return items.reduce((sum, item) => sum + item.weight, 0);
+}
+
+function repairSchedule(schedule, seed) {
+  let weight = violationTotal(computeScheduleViolations(schedule));
+  for (let round = 0; round < 4 && weight > 0; round++) {
+    const audit = computeScheduleViolations(schedule);
+    const lessonIds = [...new Set(audit.flatMap((item) => item.lessonIds || []))];
+    let moved = 0;
+    for (const lessonId of lessonIds) {
+      const result = tryRelocateLesson(schedule, lessonId, seed, weight);
+      if (result) {
+        moved += 1;
+        weight = result.weight;
+      }
+    }
+    if (!moved) return;
+  }
+}
+
+function countLessonsInBlock(schedule, lesson) {
+  if (!lesson.groupId) return 1;
+  const grid = schedule.byClass[lesson.classId] || {};
+  let count = 0;
+  Object.keys(grid).forEach((day) => {
+    grid[day].forEach((item) => {
+      if (item?.groupId === lesson.groupId) count += 1;
+    });
+  });
+  return count;
+}
+
+function tryRelocateLesson(schedule, lessonId, seed, baselineWeight) {
+  const found = findLessonById(schedule, lessonId);
+  if (!found) return null;
+  const { lesson, day, slot } = found;
+  if (lesson.groupId && countLessonsInBlock(schedule, lesson) > 1) return null;
+  const klass = classById(lesson.classId);
+  const level = klass ? levelById(klass.levelId) : null;
+  if (!klass || !level) return null;
+  const task = {
+    classId: lesson.classId,
+    classIds: lesson.classIds?.length ? lesson.classIds : [lesson.classId],
+    className: lesson.className,
+    classNames: lesson.classNames,
+    levelId: level.id,
+    subject: lesson.subject,
+    teacherId: lesson.requiredTeacherId || "",
+    possiblyLate: Boolean(lesson.possiblyLate),
+    length: 1,
+    occurrence: 1000 + (relocationCounter += 1),
+    groupRuleId: lesson.groupRuleId || "",
+    teachingGroupIndex: lesson.teachingGroupIndex || 0,
+  };
+  if (lesson.parts?.length) {
+    const rule = electiveRuleById(lesson.electiveRuleId);
+    task.electiveOptions = (rule?.options || lesson.parts).filter((option) => option.subject).map((option) => ({ subject: option.subject, teacherId: option.teacherId || "" }));
+    task.electiveRuleId = lesson.electiveRuleId || "";
+    if (!task.electiveOptions.length) return null;
+  }
+  removeLessonById(schedule, lesson.id);
+  const placements = enumeratePlacements(schedule, task, false);
+  if (!placements.length) {
+    commitLesson(schedule, lesson, day, slot);
+    return null;
+  }
+  const ranked = placements
+    .map((placement) => ({ ...placement, score: placementScore(schedule, task, placement, seed) }))
+    .sort((a, b) => a.score - b.score);
+  const records = applyTask(schedule, task, ranked[0]);
+  const weight = violationTotal(computeScheduleViolations(schedule));
+  if (weight < baselineWeight) return { weight };
+  undoTask(schedule, records);
+  commitLesson(schedule, lesson, day, slot);
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Output rendering
 // ---------------------------------------------------------------------------
 
@@ -1946,7 +3119,13 @@ function publishSchedule() {
     showAlerts([{ type: "error", text: "Generate schedules first, pick an option, then set it as official." }]);
     return;
   }
-  state.published = JSON.parse(JSON.stringify({ byClass: schedule.byClass, teacherSlots: schedule.teacherSlots, score: schedule.score }));
+  state.published = JSON.parse(JSON.stringify({
+    byClass: schedule.byClass,
+    teacherSlots: schedule.teacherSlots,
+    score: schedule.score,
+    violations: schedule.violations || [],
+    violationWeight: schedule.violationWeight || 0,
+  }));
   state.published.publishedAt = new Date().toISOString();
   saveToStorage();
   renderSchedules();
@@ -1985,6 +3164,7 @@ function renderSchedules() {
   els.scheduleTabs.innerHTML = "";
   if (!schedule) {
     els.outputTitle.textContent = role.type === "admin" ? "No schedule generated yet" : "No official schedule yet";
+    renderViolationPanel(null);
     els.scheduleCanvas.className = "schedule-canvas empty";
     els.scheduleCanvas.innerHTML = role.type === "admin"
       ? `<div class="empty-state"><h4>Build your first timetable</h4><p>Add teachers, subjects, classes, and weekly requirements, then generate schedules. You can edit any lesson before exporting.</p></div>`
@@ -1995,8 +3175,10 @@ function renderSchedules() {
   if (role.type === "admin") {
     state.schedules.forEach((item, index) => {
       const tab = document.createElement("button");
-      tab.textContent = `Option ${index + 1} - ${item.score}`;
-      tab.className = index === state.selectedSchedule ? "active" : "";
+      const broken = item.violations?.length || 0;
+      tab.textContent = broken ? `Option ${index + 1} · ⚠ ${broken}` : `Option ${index + 1} · ✓ ${item.score}`;
+      tab.className = `${index === state.selectedSchedule ? "active" : ""}${broken ? " has-violations" : ""}`;
+      tab.title = broken ? `${broken} constraint${broken === 1 ? "" : "s"} broken - select to see the list` : `All hard constraints met - score ${item.score} (lower is better)`;
       tab.addEventListener("click", () => {
         state.selectedSchedule = index;
         state.moveSource = null;
@@ -2004,11 +3186,14 @@ function renderSchedules() {
       });
       els.scheduleTabs.append(tab);
     });
+    const brokenCount = schedule.violations?.length || 0;
+    const constraintNote = brokenCount ? ` - ${brokenCount} constraint${brokenCount === 1 ? "" : "s"} broken` : " - all hard constraints met";
     const publishedNote = state.published?.publishedAt ? ` | Official set ${new Date(state.published.publishedAt).toLocaleDateString()}` : " | No official schedule set yet";
-    els.outputTitle.textContent = `Option ${state.selectedSchedule + 1} - Score ${schedule.score}${publishedNote}`;
+    els.outputTitle.textContent = `Option ${state.selectedSchedule + 1} - Score ${schedule.score}${constraintNote}${publishedNote}`;
   } else {
     els.outputTitle.textContent = `Official schedule${state.published?.publishedAt ? ` - set ${new Date(state.published.publishedAt).toLocaleDateString()}` : ""}`;
   }
+  renderViolationPanel(schedule);
   els.scheduleCanvas.innerHTML = "";
   const stack = document.createElement("div");
   stack.className = "schedule-stack";
@@ -2043,6 +3228,51 @@ function emptyMessage(text) {
   div.className = "empty-state";
   div.innerHTML = `<h4>${escapeHtml(text)}</h4>`;
   return div;
+}
+
+// Lists every constraint the selected schedule breaks, grouped by type.
+// Hidden when the schedule satisfies all hard constraints.
+function renderViolationPanel(schedule) {
+  const panel = els.violationPanel;
+  if (!panel) return;
+  const violations = schedule?.violations || [];
+  panel.classList.toggle("hidden", !violations.length);
+  panel.innerHTML = "";
+  if (!violations.length) return;
+  const heading = document.createElement("h5");
+  heading.textContent = `⚠ This option breaks ${violations.length} constraint${violations.length === 1 ? "" : "s"}`;
+  panel.append(heading);
+  const groups = new Map();
+  violations.forEach((item) => {
+    if (!groups.has(item.type)) groups.set(item.type, []);
+    groups.get(item.type).push(item);
+  });
+  groups.forEach((items, type) => {
+    const group = document.createElement("div");
+    group.className = "violation-group";
+    const label = document.createElement("p");
+    label.className = "violation-group-label";
+    label.textContent = `${VIOLATION_LABELS[type] || type} (${items.length})`;
+    group.append(label);
+    const list = document.createElement("ul");
+    const MAX_SHOWN = 12;
+    items.slice(0, MAX_SHOWN).forEach((item) => {
+      const line = document.createElement("li");
+      line.textContent = item.text;
+      list.append(line);
+    });
+    if (items.length > MAX_SHOWN) {
+      const line = document.createElement("li");
+      line.textContent = `...and ${items.length - MAX_SHOWN} more.`;
+      list.append(line);
+    }
+    group.append(list);
+    panel.append(group);
+  });
+  const hint = document.createElement("p");
+  hint.className = "violation-hint";
+  hint.textContent = "Affected lessons are outlined in red. Click a lesson to reassign, move, or clear it, or loosen the setup and regenerate.";
+  panel.append(hint);
 }
 
 function currentDepartment(role) {
@@ -2105,8 +3335,9 @@ function renderScheduleBlock(schedule, collection) {
 function renderAxisTable(collection) {
   const level = collection.level;
   const times = levelTimes(level);
-  const days = collection.type === "class" ? level.days : unionDays();
-  const slotCount = collection.type === "class" ? level.periodsPerDay : maxSlots();
+  const isClass = collection.type === "class";
+  const days = isClass ? level.days : unionDays();
+  const slotCount = isClass ? maxPeriodsForLevel(level) : maxSlots();
   const table = document.createElement("table");
   table.className = "timetable class-axis";
   const thead = document.createElement("thead");
@@ -2124,9 +3355,19 @@ function renderAxisTable(collection) {
   const tbody = document.createElement("tbody");
   days.forEach((day) => {
     const row = document.createElement("tr");
-    row.append(timeCell(day, ""));
+    const override = isClass ? dayOverride(level, day) : null;
+    const config = isClass ? dayConfig(level, day) : null;
+    row.append(timeCell(day, override ? `${config.startTime}-${config.endTime}` : ""));
+    const dayCount = isClass ? periodsForDay(level, day) : slotCount;
     for (let slot = 0; slot < slotCount; slot++) {
-      row.append(scheduleCell(collection, day, slot));
+      if (slot >= dayCount) {
+        const voidCell = document.createElement("td");
+        voidCell.className = "lesson-cell void-cell";
+        voidCell.textContent = "";
+        row.append(voidCell);
+      } else {
+        row.append(scheduleCell(collection, day, slot));
+      }
       if (times.breakInfo && times.breakInfo.afterIndex === slot) {
         const breakCell = document.createElement("td");
         breakCell.className = "break-column";
@@ -2220,8 +3461,9 @@ function timeCell(period, time) {
 
 function lessonButton(lesson, day, slot, collection) {
   const button = document.createElement("button");
-  button.className = `lesson-card ${lesson.replacementForId ? "reserve-card" : ""}`;
+  button.className = `lesson-card ${lesson.replacementForId ? "reserve-card" : ""}${lesson.violations?.length ? " violation-card" : ""}`;
   button.style.setProperty("--lesson-color", lesson.color || "#4a5568");
+  if (lesson.violations?.length) button.title = lesson.violations.join("\n");
   const groupedLine = collection.type === "class" && (lesson.classNames || []).length > 1
     ? `<span>Group: ${escapeHtml(lesson.classNames.join(", "))}</span>`
     : "";
@@ -2232,6 +3474,7 @@ function lessonButton(lesson, day, slot, collection) {
     ${lesson.possiblyLate && !lesson.replacementForId ? `<span>Late cover: ${escapeHtml((lesson.replacementNames || []).join(", ") || "none")}</span>` : ""}
     ${lesson.replacementForId ? `<span>Reserved for ${escapeHtml(lesson.replacementForName)}</span>` : ""}
     ${lesson.note ? `<span>${escapeHtml(lesson.note)}</span>` : ""}
+    ${lesson.violations?.length ? `<span class="violation-note">⚠ breaks ${lesson.violations.length} constraint${lesson.violations.length === 1 ? "" : "s"}</span>` : ""}
   `;
   const role = currentRole();
   if (!lesson.replacementForId && role.type === "admin") {
@@ -2345,7 +3588,7 @@ function moveDraggedLesson(collection, day, slot) {
     showAlerts([{ type: "error", text: error }]);
     return;
   }
-  schedule.score = scoreSchedule(schedule);
+  refreshScheduleMeta(schedule);
   renderSchedules();
   saveToStorage();
 }
@@ -2389,7 +3632,7 @@ function handleSlotClick(collection, day, slot, lesson) {
     return true;
   }
   state.moveSource = null;
-  schedule.score = scoreSchedule(schedule);
+  refreshScheduleMeta(schedule);
   renderSchedules();
   saveToStorage();
   showAlerts([{ type: "success", text: lesson ? "Lessons swapped." : "Lesson moved." }]);
@@ -2399,9 +3642,20 @@ function handleSlotClick(collection, day, slot, lesson) {
 function openLessonEditor(day, slot, collection, lesson) {
   state.editTarget = { scheduleIndex: state.selectedSchedule, day, slot, collection, existing: lesson };
   els.moveLessonBtn.classList.toggle("hidden", !lesson);
-  populateOptions(els.editSubject, state.subjects.map((subject) => subject.name), [lesson?.subject || state.subjects[0]?.name || ""]);
-  refreshTeacherEditOptions(lesson?.teacherId || "");
-  els.editSubject.onchange = () => refreshTeacherEditOptions("");
+  // Elective split lessons keep their subjects/teachers as a unit; only the
+  // note can be edited. Move/Swap and Clear still work on the whole cell.
+  const isElective = Boolean(lesson?.parts?.length);
+  if (isElective) {
+    populateOptions(els.editSubject, [lesson.subject], [lesson.subject]);
+    populateOptions(els.editTeacher, [lesson.teacherName], [lesson.teacherName]);
+  } else {
+    populateOptions(els.editSubject, state.subjects.map((subject) => subject.name), [lesson?.subject || state.subjects[0]?.name || ""]);
+    refreshTeacherEditOptions(lesson?.teacherId || "");
+  }
+  els.editSubject.disabled = isElective;
+  els.editTeacher.disabled = isElective;
+  els.editLate.disabled = isElective;
+  els.editSubject.onchange = isElective ? null : () => refreshTeacherEditOptions("");
   els.editNote.value = lesson?.note || "";
   els.editLate.checked = Boolean(lesson?.possiblyLate);
   els.lessonDialog.showModal();
@@ -2417,6 +3671,16 @@ function saveEditedLesson() {
   const target = state.editTarget;
   if (!target) return;
   const schedule = state.schedules[target.scheduleIndex];
+  if (target.existing?.parts?.length) {
+    const lesson = { ...target.existing, note: els.editNote.value };
+    removeLessonById(schedule, lesson.id);
+    commitLesson(schedule, lesson, target.day, target.slot);
+    refreshScheduleMeta(schedule);
+    els.lessonDialog.close();
+    renderSchedules();
+    saveToStorage();
+    return;
+  }
   const subject = els.editSubject.value;
   const teacher = state.teachers.find((item) => item.id === els.editTeacher.value);
   if (!teacher) {
@@ -2457,7 +3721,7 @@ function saveEditedLesson() {
   }
   removeLessonById(schedule, lesson.id);
   commitLesson(schedule, lesson, target.day, target.slot);
-  schedule.score = scoreSchedule(schedule);
+  refreshScheduleMeta(schedule);
   els.lessonDialog.close();
   renderSchedules();
   saveToStorage();
@@ -2471,7 +3735,7 @@ function clearEditedLesson() {
   }
   const schedule = state.schedules[target.scheduleIndex];
   removeLessonById(schedule, target.existing.id);
-  schedule.score = scoreSchedule(schedule);
+  refreshScheduleMeta(schedule);
   els.lessonDialog.close();
   renderSchedules();
   saveToStorage();
@@ -2483,18 +3747,23 @@ function manualConflict(schedule, lesson, day, slot, existingId = "") {
   const klass = classes[0];
   const level = klass ? levelById(klass.levelId) : null;
   if (!klass || !level) return "The class for this lesson no longer exists.";
-  if (!level.days.includes(day) || slot >= level.periodsPerDay) return `${klass.name} has no period ${slot + 1} on ${day}.`;
+  if (!level.days.includes(day) || slot >= periodsForDay(level, day)) return `${klass.name} has no period ${slot + 1} on ${day}.`;
   for (const item of classes) {
     if (item.blocked[day]?.[slot]) return `${item.name} is blocked in this slot.`;
     const classSlot = schedule.byClass[item.id][day]?.[slot];
     if (classSlot && classSlot.id !== existingId) return `${item.name} already has a lesson in this slot.`;
   }
-  const teacherSlot = schedule.teacherSlots[lesson.teacherId]?.[day]?.[slot];
-  if (state.constraints.preventTeacherClashes && teacherSlot && teacherSlot.id !== existingId) return `${lesson.teacherName} is already teaching ${teacherSlot.className} in this slot.`;
-  const teacher = state.teachers.find((item) => item.id === lesson.teacherId);
-  if (state.constraints.honorAvailability && teacher?.availability[day]?.[slot] === false) return `${lesson.teacherName} is unavailable in this slot.`;
-  const teacherDailyCount = (schedule.teacherSlots[lesson.teacherId]?.[day] || []).filter((item) => item && item.id !== existingId).length;
-  if (teacher && teacherDailyCount >= (teacher.maxPerDay || state.settings.maxTeacherPerDay)) return `${lesson.teacherName} has reached the daily teaching limit.`;
+  const duties = lesson.parts?.length
+    ? lesson.parts.map((part) => ({ teacherId: part.teacherId, teacherName: part.teacherName }))
+    : [{ teacherId: lesson.teacherId, teacherName: lesson.teacherName }];
+  for (const duty of duties) {
+    const teacherSlot = schedule.teacherSlots[duty.teacherId]?.[day]?.[slot];
+    if (state.constraints.preventTeacherClashes && teacherSlot && teacherSlot.id !== existingId) return `${duty.teacherName} is already teaching ${teacherSlot.className} in this slot.`;
+    const teacher = state.teachers.find((item) => item.id === duty.teacherId);
+    if (state.constraints.honorAvailability && teacher?.availability[day]?.[slot] === false) return `${duty.teacherName} is unavailable in this slot.`;
+    const teacherDailyCount = (schedule.teacherSlots[duty.teacherId]?.[day] || []).filter((item) => item && item.id !== existingId).length;
+    if (teacher && teacherDailyCount >= (teacher.maxPerDay || state.settings.maxTeacherPerDay)) return `${duty.teacherName} has reached the daily teaching limit.`;
+  }
   if (lesson.possiblyLate && !(lesson.replacementIds || []).length) return `${lesson.teacherName} has no replacement teacher assigned.`;
   for (const replacementId of lesson.replacementIds || []) {
     const replacement = state.teachers.find((item) => item.id === replacementId);
@@ -2585,7 +3854,7 @@ function downloadBlob(blob, filename) {
 function classPdf(schedule, klass) {
   const level = levelById(klass.levelId) || referenceLevel();
   const times = levelTimes(level);
-  const columns = buildPdfColumns(times, level.periodsPerDay);
+  const columns = buildPdfColumns(times, maxPeriodsForLevel(level));
   const rows = level.days.map((day) => ({
     head: day,
     cells: columns.map((column) => {
@@ -2833,32 +4102,69 @@ function showAlerts(items) {
   });
 }
 
+// Persists the full setup plus generated schedules. If localStorage runs out
+// of space, generated schedules are progressively trimmed (the setup itself
+// is always kept) so the user's inputs are never lost to a quota error.
 function saveToStorage() {
-  try {
-    const current = state.schedules[state.selectedSchedule];
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      settings: state.settings,
-      constraints: state.constraints,
-      levels: state.levels,
-      subjects: state.subjects,
-      teachers: state.teachers,
-      classes: state.classes,
-      departments: state.departments,
-      groupingRules: state.groupingRules,
-      schedules: current ? [current] : [],
-      selectedSchedule: 0,
-      selectedLevelId: state.selectedLevelId,
-      selectedClassId: state.selectedClassId,
-      selectedTeacherId: state.selectedTeacherId,
-      selectedDepartmentId: state.selectedDepartmentId,
-      selectedDeptSubject: state.selectedDeptSubject,
-      view: state.view,
-      session: state.session,
-      published: state.published,
-    }));
-  } catch {
-    // Storage may be full or unavailable; the app keeps working in memory.
+  const payload = {
+    settings: state.settings,
+    constraints: state.constraints,
+    levels: state.levels,
+    subjects: state.subjects,
+    teachers: state.teachers,
+    classes: state.classes,
+    departments: state.departments,
+    groupingRules: state.groupingRules,
+    electiveRules: state.electiveRules,
+    schedules: state.schedules,
+    selectedSchedule: state.selectedSchedule,
+    selectedLevelId: state.selectedLevelId,
+    selectedClassId: state.selectedClassId,
+    selectedTeacherId: state.selectedTeacherId,
+    selectedDepartmentId: state.selectedDepartmentId,
+    selectedDeptSubject: state.selectedDeptSubject,
+    view: state.view,
+    session: state.session,
+    published: state.published,
+    savedAt: new Date().toISOString(),
+  };
+  const current = state.schedules[state.selectedSchedule];
+  const fallbacks = [
+    state.schedules,
+    state.schedules.slice(0, 3),
+    current ? [current] : [],
+    [],
+  ];
+  for (const schedules of fallbacks) {
+    try {
+      payload.schedules = schedules;
+      payload.selectedSchedule = Math.max(0, schedules.indexOf(current));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+      state.lastSavedAt = payload.savedAt;
+      updateSaveStatus();
+      return true;
+    } catch {
+      // Quota exceeded or storage unavailable; retry with fewer schedules.
+    }
   }
+  updateSaveStatus(true);
+  return false;
+}
+
+function updateSaveStatus(failed = false) {
+  if (!els.saveStatus) return;
+  if (failed) {
+    els.saveStatus.textContent = "Could not save (storage unavailable)";
+    els.saveStatus.classList.add("save-failed");
+    return;
+  }
+  els.saveStatus.classList.remove("save-failed");
+  if (!state.lastSavedAt) {
+    els.saveStatus.textContent = "";
+    return;
+  }
+  const time = new Date(state.lastSavedAt);
+  els.saveStatus.textContent = `Saved ${time.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
 }
 
 function loadFromStorage() {
@@ -2879,6 +4185,8 @@ function loadFromStorage() {
       const hydrated = Object.assign(createLevel(level.name || "Level"), level);
       hydrated.subjectBlocks ||= {};
       hydrated.sessionPatterns ||= {};
+      hydrated.dayOverrides ||= {};
+      hydrated.minPeriodLength ||= MIN_PERIOD_LENGTH;
       return hydrated;
     });
     state.subjects = data.subjects || [];
@@ -2886,8 +4194,14 @@ function loadFromStorage() {
     state.classes = data.classes || [];
     state.departments = data.departments || [];
     state.groupingRules = (data.groupingRules || []).map((rule) => createGroupingRule(rule));
-    state.schedules = data.schedules || [];
-    state.selectedSchedule = 0;
+    state.electiveRules = (data.electiveRules || []).map((rule) => createElectiveRule(rule));
+    state.schedules = (data.schedules || []).map((schedule) => {
+      schedule.violations ||= [];
+      schedule.violationWeight ||= 0;
+      return schedule;
+    });
+    state.selectedSchedule = Math.min(Math.max(0, Number(data.selectedSchedule) || 0), Math.max(0, state.schedules.length - 1));
+    state.lastSavedAt = data.savedAt || null;
     state.selectedLevelId = data.selectedLevelId || "";
     state.selectedClassId = data.selectedClassId || "";
     state.selectedTeacherId = data.selectedTeacherId || "";
@@ -3658,6 +4972,7 @@ function applyImport(parsed) {
   const uncovered = subjectNames.filter((name) => !covered.has(name));
   if (uncovered.length) state.departments.push(createDepartment("Other", uncovered));
 
+  state.electiveRules = [];
   state.groupingRules = (parsed.groupingRules || []).map((rule) => createGroupingRule({
     id: rule.id,
     subject: rule.subject,

@@ -844,9 +844,8 @@ select:focus {
 }
 
 .level-times {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem;
+  display: grid;
+  gap: 0.45rem;
   margin-bottom: 0.8rem;
 }
 
@@ -1011,6 +1010,176 @@ body.locked .app-shell {
   outline-offset: 2px;
 }
 
+/* --- v3: broken-constraint reporting, per-day timing, save status --- */
+
+.violation-panel {
+  margin: 0.9rem 1.2rem 0;
+  padding: 0.9rem 1rem;
+  border: 1px solid #f0ca7c;
+  border-left: 5px solid #d99a1b;
+  border-radius: var(--radius);
+  background: #fff9ec;
+}
+
+.violation-panel h5 {
+  margin: 0 0 0.55rem;
+  color: #7a5200;
+  font-size: 0.95rem;
+}
+
+.violation-group {
+  margin-bottom: 0.55rem;
+}
+
+.violation-group-label {
+  margin: 0 0 0.2rem;
+  color: #7a5200;
+  font-size: 0.8rem;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.violation-group ul {
+  margin: 0;
+  padding-left: 1.2rem;
+  color: #614100;
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+
+.violation-hint {
+  margin: 0.55rem 0 0;
+  color: #8a6a1f;
+  font-size: 0.8rem;
+}
+
+.lesson-card.violation-card {
+  outline: 2px solid var(--danger);
+  outline-offset: -1px;
+}
+
+.violation-note {
+  color: var(--danger) !important;
+  font-weight: 800;
+}
+
+.schedule-tabs button.has-violations {
+  border-color: #f0ca7c;
+  background: #fff9ec;
+  color: #7a5200;
+}
+
+.schedule-tabs button.has-violations.active {
+  color: #fff;
+  border-color: #b7791f;
+  background: #b7791f;
+}
+
+.void-cell,
+.void-slot {
+  background: repeating-linear-gradient(135deg, var(--surface-2), var(--surface-2) 6px, #fff 6px, #fff 12px) !important;
+}
+
+.day-overrides {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.day-override-row {
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fbfcfd;
+}
+
+.day-override-row.active {
+  border-color: rgba(23, 107, 91, 0.35);
+  background: #f2faf7;
+}
+
+.day-override-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  cursor: pointer;
+}
+
+.day-override-head input {
+  width: 18px;
+  min-height: auto;
+  accent-color: var(--primary);
+}
+
+.day-override-head small {
+  color: var(--muted);
+}
+
+.day-override-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0.6rem;
+  margin-top: 0.7rem;
+}
+
+.day-override-row .advanced-toggle {
+  margin: 0.7rem 0 0.5rem;
+}
+
+.level-times-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  width: 100%;
+}
+
+.time-chip.day-chip {
+  background: #1d3030;
+  border-color: #1d3030;
+  color: #fff;
+  font-weight: 800;
+}
+
+.save-status {
+  min-height: 1em;
+  margin: -0.25rem 0 0;
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 0.76rem;
+  text-align: center;
+}
+
+.save-status.save-failed {
+  color: #ffb3ab;
+}
+
+@media (max-width: 1040px) {
+  .day-override-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.elective-rule-editor {
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+
+.elective-options {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 0.55rem;
+}
+
+.elective-option-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) auto;
+  gap: 0.55rem;
+  align-items: end;
+}
+
+.elective-options > button {
+  justify-self: start;
+}
+
 .schedule-canvas.move-mode .lesson-cell {
   cursor: crosshair;
 }
@@ -1035,6 +1204,7 @@ body.locked .app-shell {
   .output-header,
   .schedule-tabs,
   .alerts,
+  .violation-panel,
   .lesson-dialog {
     display: none !important;
   }

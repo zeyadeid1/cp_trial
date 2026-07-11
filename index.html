@@ -37,6 +37,7 @@
           <input id="excelFileInput" type="file" accept=".xlsx" hidden />
           <button id="loadDemoBtn" class="secondary full">Load Demo</button>
           <button id="saveBtn" class="secondary full">Save Draft</button>
+          <p id="saveStatus" class="save-status" aria-live="polite"></p>
           <button id="resetBtn" class="ghost full">Reset</button>
         </div>
       </aside>
@@ -85,7 +86,14 @@
             <label class="field">
               <span>Period Length</span>
               <div class="input-suffix">
-                <input id="levelPeriodLength" type="number" min="20" max="120" value="45" />
+                <input id="levelPeriodLength" type="number" min="20" max="240" value="45" />
+                <b>min</b>
+              </div>
+            </label>
+            <label class="field">
+              <span>Minimum Period Length</span>
+              <div class="input-suffix">
+                <input id="levelMinPeriod" type="number" min="5" max="120" value="20" />
                 <b>min</b>
               </div>
             </label>
@@ -110,15 +118,22 @@
           <div class="day-picker" id="levelDayPicker" aria-label="School days for this level"></div>
 
           <div class="mini-heading">Daily Timing</div>
-          <p class="hint">If full-length periods do not fit before the end time, periods after the break are shortened automatically (for days ending before 14:30, only the first 3 periods keep full length). Start and end times are never broken.</p>
+          <p class="hint">If full-length periods do not fit before the end time, periods after the break are shortened automatically, but never below the minimum period length (for days ending before 14:30, only the first 3 periods keep full length). Start and end times are never broken.</p>
           <div id="levelTimesPreview" class="level-times"></div>
 
           <label class="check-card advanced-toggle">
             <input id="customLengthsToggle" type="checkbox" />
             <span>Advanced: custom period lengths</span>
-            <small>Set the length of each period of this level by hand.</small>
+            <small>Set the length of each period of this level by hand (applies to every day without a per-day override).</small>
           </label>
           <div id="customLengthsWrap" class="custom-length-grid"></div>
+
+          <label class="check-card advanced-toggle">
+            <input id="dayOverridesToggle" type="checkbox" />
+            <span>Advanced: per-day timing</span>
+            <small>Give individual days their own start and end times, period count, break, and per-period lengths. Unticking this removes all per-day overrides.</small>
+          </label>
+          <div id="dayOverridesWrap" class="day-overrides"></div>
         </section>
 
         <section id="teachers" class="panel-section">
@@ -182,7 +197,7 @@
           <div class="section-heading">
             <div>
               <h3>Constraints</h3>
-              <p>Hard rules must be met. Preferences are used to rank alternatives.</p>
+              <p>Hard rules must be met. Preferences are used to rank alternatives. If no timetable can satisfy every hard rule, the generator shows the closest options and lists exactly which constraints each one breaks.</p>
             </div>
           </div>
           <div class="constraint-grid">
@@ -233,15 +248,15 @@
               <input id="maxSubjectPerDay" type="number" min="1" max="5" value="1" />
             </label>
             <label class="field">
-              <span>Candidate Limit</span>
-              <input id="candidateLimit" type="number" min="1" max="80" value="12" />
+              <span>Schedules To Generate</span>
+              <input id="candidateLimit" type="number" min="1" max="80" value="12" title="How many candidate schedules to keep. Also caps how many best-effort schedules are shown when no perfect timetable exists." />
             </label>
           </div>
 
           <div class="section-heading">
             <div>
-              <h3>Session Patterns and Grouped Classes</h3>
-              <p>Set exact lesson block patterns such as 2+3+1, and edit subjects taught to multiple classes as one group.</p>
+              <h3>Session Patterns, Grouped Classes, and Elective Splits</h3>
+              <p>Set exact lesson block patterns such as 2+3+1, teach one subject to several classes as one group, or split classes into parallel subjects (e.g. part takes German while the rest takes French, at the same time).</p>
             </div>
           </div>
           <div id="blockRules" class="block-rules"></div>
@@ -280,6 +295,7 @@
           </div>
 
           <div id="alerts" class="alerts"></div>
+          <div id="violationPanel" class="violation-panel hidden"></div>
           <div id="scheduleTabs" class="schedule-tabs"></div>
           <div id="scheduleCanvas" class="schedule-canvas empty">
             <div class="empty-state">
