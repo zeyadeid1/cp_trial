@@ -9,11 +9,14 @@ const state = {
     candidateLimit: 12,
     maxTeacherPerDay: 6,
     maxSubjectPerDay: 1,
+    constraintPriorities: {},
   },
   constraints: {
     honorAvailability: true,
     preventTeacherClashes: true,
     requireQualifiedTeacher: true,
+    consistentTeacher: true,
+    honorFixedTeachers: true,
     avoidSameSubjectDay: true,
     balanceTeacherLoad: true,
     avoidClassGaps: true,
@@ -24,6 +27,7 @@ const state = {
   teachers: [],
   classes: [],
   departments: [],
+  branches: [],
   groupingRules: [],
   electiveRules: [],
   schedules: [],
@@ -79,6 +83,10 @@ function cacheElements() {
     "addSubjectBtn",
     "departmentList",
     "addDepartmentBtn",
+    "branchLevelPicker",
+    "addBranchBtn",
+    "branchList",
+    "constraintPriorities",
     "classPicker",
     "addClassBtn",
     "classList",
@@ -159,6 +167,15 @@ function bindGlobalEvents() {
     state.levels = state.levels.filter((item) => item.id !== level.id);
     state.groupingRules = state.groupingRules.filter((rule) => rule.levelId !== level.id);
     state.electiveRules = (state.electiveRules || []).filter((rule) => rule.levelId !== level.id);
+    state.branches = (state.branches || []).filter((branch) => branch.levelId !== level.id);
+    state.teachers.forEach((teacher) => {
+      Object.keys(teacher.subjectLevels || {}).forEach((subjectName) => {
+        // An emptied list means "teaches this subject nowhere" - safer than
+        // silently expanding a narrowly-scoped teacher to every level.
+        teacher.subjectLevels[subjectName] = teacher.subjectLevels[subjectName].filter((id) => id !== level.id);
+      });
+    });
+    syncBranchClasses();
     state.selectedLevelId = state.levels[0]?.id || "";
     normalizeAvailability();
     renderAll();
@@ -233,6 +250,12 @@ function bindGlobalEvents() {
     state.teacherSearch = "";
     els.teacherSearch.value = "";
     renderAll();
+    const cards = els.teacherList.querySelectorAll(".teacher-card");
+    const last = cards[cards.length - 1];
+    if (last) {
+      last.scrollIntoView({ behavior: "smooth", block: "center" });
+      last.querySelector('[data-field="name"]')?.focus();
+    }
   });
   els.addSubjectBtn.addEventListener("click", () => {
     state.subjects.push(createSubject(`Subject ${state.subjects.length + 1}`));
@@ -246,6 +269,17 @@ function bindGlobalEvents() {
     const klass = createClass(`Class ${state.classes.length + 1}`, selectedLevel()?.id || state.levels[0]?.id || "");
     state.classes.push(klass);
     state.selectedClassId = klass.id;
+    renderAll();
+  });
+  els.branchLevelPicker.addEventListener("change", () => {
+    state.selectedLevelId = els.branchLevelPicker.value;
+    renderAll();
+  });
+  els.addBranchBtn.addEventListener("click", () => {
+    const level = selectedLevel();
+    if (!level) return;
+    const count = (state.branches || []).filter((branch) => branch.levelId === level.id).length;
+    state.branches.push(createBranch(`Branch ${count + 1}`, level.id));
     renderAll();
   });
   els.classPicker.addEventListener("change", () => {
@@ -323,6 +357,7 @@ function bindGlobalEvents() {
     state.teachers = [];
     state.classes = [];
     state.departments = [];
+    state.branches = [];
     state.electiveRules = [];
     renderAll();
     showAlerts([{ type: "success", text: "Draft reset." }]);
@@ -377,6 +412,9 @@ function createLevel(name = "Level", overrides = {}) {
     periodsPerDay: 7,
     breakAfter: 3,
     breakLength: 25,
+    classCount: 0,
+    minClassSize: 0,
+    maxClassSize: 0,
     customLengths: null,
     dayOverrides: {},
     showDayOverrides: false,
@@ -538,6 +576,11 @@ function createTeacher(name = "", subjects = [], maxPerDay = null) {
     id: uid("tea"),
     name,
     subjects,
+    // Optional level scoping per subject: { "Science": [levelId, ...] }.
+    // A subject with no entry is teachable in every level. This is how
+    // "Science (First Secondary)" and "Science (Second Secondary)" can have
+    // different teachers without duplicating the subject itself.
+    subjectLevels: {},
     maxPerDay: maxPerDay || state.settings.maxTeacherPerDay,
     replacementIds: [],
     availability: {},
@@ -565,6 +608,261 @@ function createClass(name = "", levelId = "", requirements = []) {
 
 function createDepartment(name = "", subjectNames = [], hodTeacherId = "") {
   return { id: uid("dep"), name, subjectNames, hodTeacherId };
+}
+
+// A branch (stream) of a level, e.g. Third Secondary "Science". Branches are
+// per-level objects: two levels can both have an "Art" branch and they stay
+// completely independent. A branch declares how many STUDENTS it has and
+// which subjects they take. A requirement row's `students` field (0 = all)
+// says how many of the branch's students take that subject - partial takers
+// become co-timed choice groups pooled across classes and shareable branches.
+// Class objects are formed automatically from student counts and the level's
+// class count / size limits.
+function createBranch(name = "Branch", levelId = "", overrides = {}) {
+  return Object.assign({
+    id: uid("brn"),
+    name,
+    levelId,
+    studentCount: 30,
+    shareWithBranchIds: [],
+    requirements: [],
+  }, overrides);
+}
+
+function branchTakers(branch, subjectName) {
+  const requirement = branch.requirements.find((item) => item.subject === subjectName && item.count > 0);
+  if (!requirement) return 0;
+  const takers = Number(requirement.students || 0);
+  return takers > 0 ? Math.min(takers, Number(branch.studentCount) || 0) : Number(branch.studentCount) || 0;
+}
+
+// Largest-remainder split of `total` across weights (keeps the sum exact).
+function distributeCount(weights, total) {
+  const sum = weights.reduce((acc, weight) => acc + weight, 0);
+  if (sum <= 0 || total <= 0) return weights.map(() => 0);
+  const raw = weights.map((weight) => (weight * total) / sum);
+  const result = raw.map(Math.floor);
+  let remainder = total - result.reduce((acc, value) => acc + value, 0);
+  const order = raw.map((value, index) => ({ index, frac: value - Math.floor(value) })).sort((a, b) => b.frac - a.frac);
+  for (let i = 0; i < order.length && remainder > 0; i++, remainder--) result[order[i].index] += 1;
+  return result;
+}
+
+function branchById(id) {
+  return (state.branches || []).find((branch) => branch.id === id) || null;
+}
+
+// The weekly subjects a class attends TOGETHER as one room. For branch-formed
+// classes these are the subjects fully taken by every branch represented in
+// the class (partial-taker "choice" subjects are scheduled separately as
+// pooled student groups by the sectioning plan). Plain classes keep their own
+// list.
+function classRequirements(klass) {
+  if (!klass.branchId) return klass.requirements;
+  const composition = (klass.composition?.length ? klass.composition : [{ branchId: klass.branchId, students: 0 }])
+    .map((part) => ({ ...part, branch: branchById(part.branchId) }))
+    .filter((part) => part.branch);
+  if (!composition.length) return klass.requirements;
+  const subjects = new Map();
+  composition.forEach(({ branch }) => branch.requirements.forEach((requirement) => {
+    if (!(requirement.count > 0)) return;
+    if (!subjects.has(requirement.subject)) subjects.set(requirement.subject, []);
+    subjects.get(requirement.subject).push({ branch, requirement });
+  }));
+  const rows = [];
+  subjects.forEach((entries, subjectName) => {
+    const commonForAll = composition.every(({ branch }) =>
+      branch.requirements.some((item) => item.subject === subjectName && item.count > 0)
+      && branchTakers(branch, subjectName) >= (Number(branch.studentCount) || 0));
+    if (!commonForAll) return;
+    const count = Math.max(...entries.map((entry) => Number(entry.requirement.count)));
+    const teacherId = entries.find((entry) => entry.requirement.teacherId)?.requirement.teacherId || "";
+    const groupRuleId = entries.find((entry) => entry.requirement.groupRuleId)?.requirement.groupRuleId;
+    rows.push(req(subjectName, count, teacherId, entries.some((entry) => entry.requirement.possiblyLate), groupRuleId ? { groupRuleId } : {}));
+  });
+  return rows;
+}
+
+// Packs the level's branch students into level.classCount classes. Branches
+// allowed to share classes are packed together (mixed classes happen at the
+// boundaries); other branches never mix. Existing class objects are reused in
+// order so ids and blocked slots survive re-packing.
+function packBranchClasses(level, branches) {
+  const active = branches.filter((branch) => (Number(branch.studentCount) || 0) > 0);
+  if (!active.length) return [];
+  const maxSize = Number(level.maxClassSize) > 0 ? Number(level.maxClassSize) : 30;
+  const total = active.reduce((sum, branch) => sum + Number(branch.studentCount), 0);
+  const canShare = (a, b) => (a.shareWithBranchIds || []).includes(b.id) || (b.shareWithBranchIds || []).includes(a.id);
+  const components = [];
+  active.forEach((branch) => {
+    const touching = components.filter((component) => component.some((member) => canShare(member, branch)));
+    if (!touching.length) {
+      components.push([branch]);
+    } else {
+      const merged = [branch, ...touching.flat()];
+      touching.forEach((component) => components.splice(components.indexOf(component), 1));
+      components.push(merged);
+    }
+  });
+  let classCount = Number(level.classCount) > 0 ? Number(level.classCount) : Math.max(1, Math.ceil(total / maxSize));
+  classCount = Math.max(classCount, components.length);
+  const comps = components.map((members) => ({
+    members: members.slice().sort((a, b) => Number(b.studentCount) - Number(a.studentCount)),
+    students: members.reduce((sum, branch) => sum + Number(branch.studentCount), 0),
+  }));
+  const classShares = distributeCount(comps.map((comp) => comp.students), classCount - comps.length);
+  comps.forEach((comp, index) => {
+    comp.classes = 1 + classShares[index];
+  });
+  const specs = [];
+  comps.forEach((comp) => {
+    const sizes = distributeCount(Array.from({ length: comp.classes }, () => 1), comp.students);
+    const stream = comp.members.map((branch) => ({ branch, remaining: Number(branch.studentCount) }));
+    sizes.forEach((size) => {
+      const composition = [];
+      let filled = 0;
+      while (filled < size && stream.length) {
+        const head = stream[0];
+        const take = Math.min(head.remaining, size - filled);
+        if (take > 0) {
+          composition.push({ branchId: head.branch.id, students: take });
+          filled += take;
+          head.remaining -= take;
+        }
+        if (head.remaining <= 0) stream.shift();
+      }
+      if (composition.length) specs.push({ composition });
+    });
+  });
+  specs.forEach((spec, index) => {
+    const names = [...new Set(spec.composition.map((part) => branchById(part.branchId)?.name).filter(Boolean))];
+    spec.name = `${level.name} ${names.join("/")} ${index + 1}`;
+  });
+  return specs;
+}
+
+function syncBranchClasses() {
+  const keepIds = new Set();
+  const branchIds = new Set((state.branches || []).map((branch) => branch.id));
+  const byLevel = new Map();
+  (state.branches || []).forEach((branch) => {
+    if (!levelById(branch.levelId)) return;
+    if (!byLevel.has(branch.levelId)) byLevel.set(branch.levelId, []);
+    byLevel.get(branch.levelId).push(branch);
+  });
+  byLevel.forEach((branches, levelId) => {
+    const level = levelById(levelId);
+    const specs = packBranchClasses(level, branches);
+    const existing = state.classes.filter((klass) => klass.levelId === levelId && klass.branchId);
+    specs.forEach((spec, index) => {
+      let klass = existing[index];
+      if (!klass) {
+        klass = createClass(spec.name, levelId);
+        state.classes.push(klass);
+      }
+      klass.name = spec.name;
+      klass.levelId = levelId;
+      klass.branchId = spec.composition[0].branchId;
+      klass.composition = spec.composition;
+      keepIds.add(klass.id);
+    });
+  });
+  state.classes = state.classes.filter((klass) => !klass.branchId || (branchIds.has(klass.branchId) && keepIds.has(klass.id)));
+}
+
+// The sectioning plan for one level: which subjects are "choice" subjects
+// (taken by only part of the students), how their takers distribute across
+// the formed classes, and how those takers pool into teaching groups within
+// the level's min/max class-size limits. Choice subjects run co-timed so a
+// class's students can split to their own group and re-merge afterwards.
+function levelSectioningPlan(level) {
+  const branches = (state.branches || []).filter((branch) => branch.levelId === level.id && (Number(branch.studentCount) || 0) > 0);
+  if (!branches.length) return null;
+  const classes = state.classes.filter((klass) => klass.levelId === level.id && klass.branchId);
+  const minSize = Number(level.minClassSize) || 0;
+  const maxSize = Number(level.maxClassSize) || 0;
+  const warnings = [];
+  const partsByBranch = {};
+  classes.forEach((klass) => (klass.composition || []).forEach((part) => {
+    (partsByBranch[part.branchId] ||= []).push({ classId: klass.id, students: part.students });
+  }));
+  const choiceMap = new Map();
+  branches.forEach((branch) => {
+    branch.requirements.forEach((requirement) => {
+      if (!(requirement.count > 0)) return;
+      const takers = branchTakers(branch, requirement.subject);
+      if (takers <= 0 || takers >= (Number(branch.studentCount) || 0)) return;
+      if (!choiceMap.has(requirement.subject)) {
+        choiceMap.set(requirement.subject, { subject: requirement.subject, weekly: 0, weeklySet: new Set(), takersByClass: new Map(), totalTakers: 0 });
+      }
+      const entry = choiceMap.get(requirement.subject);
+      entry.weeklySet.add(Number(requirement.count));
+      entry.weekly = Math.max(entry.weekly, Number(requirement.count));
+      entry.totalTakers += takers;
+      const parts = partsByBranch[branch.id] || [];
+      const split = distributeCount(parts.map((part) => part.students), takers);
+      parts.forEach((part, index) => {
+        if (split[index] > 0) entry.takersByClass.set(part.classId, (entry.takersByClass.get(part.classId) || 0) + split[index]);
+      });
+    });
+  });
+  const classOrder = classes.map((klass) => klass.id);
+  const choiceSubjects = [...choiceMap.values()].map((entry) => {
+    if (entry.weeklySet.size > 1) warnings.push(`${level.name}: ${entry.subject} has different weekly counts across branches; using ${entry.weekly}.`);
+    const chunks = classOrder
+      .filter((classId) => entry.takersByClass.has(classId))
+      .map((classId) => ({ classId, students: entry.takersByClass.get(classId) }));
+    return { subject: entry.subject, weekly: entry.weekly, totalTakers: entry.totalTakers, groups: buildGroups(chunks, minSize, maxSize, entry.totalTakers) };
+  });
+  const weekly = choiceSubjects.reduce((most, subject) => Math.max(most, subject.weekly), 0);
+  if (choiceSubjects.some((subject) => subject.weekly !== weekly)) {
+    warnings.push(`${level.name}: choice subjects share timetable slots, so their weekly periods should match; using ${weekly} for all.`);
+  }
+  const clusterClassIds = classOrder.filter((classId) => choiceSubjects.some((subject) => subject.groups.some((group) => group.chunks.some((chunk) => chunk.classId === classId))));
+  const classSizeIssues = [];
+  classes.forEach((klass) => {
+    const size = (klass.composition || []).reduce((sum, part) => sum + part.students, 0);
+    if (maxSize > 0 && size > maxSize) classSizeIssues.push({ classId: klass.id, size, kind: "max", limit: maxSize });
+    if (minSize > 0 && size < minSize) {
+      const wholeBranches = (klass.composition || []).reduce((sum, part) => sum + (Number(branchById(part.branchId)?.studentCount) || 0), 0);
+      const exempt = size === wholeBranches;
+      if (!exempt) classSizeIssues.push({ classId: klass.id, size, kind: "min", limit: minSize });
+    }
+  });
+  return { level, choiceSubjects, weekly, clusterClassIds, warnings, classSizeIssues };
+}
+
+// Greedy pooling of per-class taker chunks into teaching groups. A chunk can
+// split across groups (part of a class's takers with one group, the rest with
+// another). Below-minimum groups are only legal when the subject's total
+// takers are below the minimum themselves.
+function buildGroups(chunks, minSize, maxSize, totalTakers) {
+  const groups = [];
+  let current = { students: 0, chunks: [] };
+  const push = () => {
+    if (current.students > 0) groups.push(current);
+    current = { students: 0, chunks: [] };
+  };
+  chunks.forEach(({ classId, students }) => {
+    let remaining = students;
+    while (remaining > 0) {
+      const space = maxSize > 0 ? maxSize - current.students : remaining;
+      if (space <= 0) {
+        push();
+        continue;
+      }
+      const take = Math.min(space, remaining);
+      current.chunks.push({ classId, students: take });
+      current.students += take;
+      remaining -= take;
+    }
+  });
+  push();
+  groups.forEach((group) => {
+    group.aboveMax = maxSize > 0 && group.students > maxSize;
+    group.belowMin = minSize > 0 && group.students < minSize && totalTakers >= minSize;
+  });
+  return groups;
 }
 
 function createGroupingRule(overrides = {}) {
@@ -612,11 +910,13 @@ function uid(prefix) {
 }
 
 function loadDemo() {
-  state.settings = { candidateLimit: 12, maxTeacherPerDay: 6, maxSubjectPerDay: 2 };
+  state.settings = { candidateLimit: 12, maxTeacherPerDay: 6, maxSubjectPerDay: 2, constraintPriorities: {} };
   state.constraints = {
     honorAvailability: true,
     preventTeacherClashes: true,
     requireQualifiedTeacher: true,
+    consistentTeacher: true,
+    honorFixedTeachers: true,
     avoidSameSubjectDay: true,
     balanceTeacherLoad: true,
     avoidClassGaps: true,
@@ -631,6 +931,7 @@ function loadDemo() {
   state.teachers = buildDefaultTeachers();
   state.classes = buildDefaultClasses();
   state.departments = buildDefaultDepartments();
+  state.branches = [];
   state.groupingRules = [];
   state.electiveRules = buildDefaultElectiveRules();
   state.schedules = [];
@@ -692,7 +993,7 @@ function buildDefaultClasses() {
     [state.levels[0], () => [
       req("Science", 6),
       req("Arabic", 6),
-      req("English", 7),
+      req("English", 6),
       req("Math", 6),
       req("History", 5),
       req("Philosophy", 4),
@@ -708,9 +1009,9 @@ function buildDefaultClasses() {
       req("Psychology", 3),
     ]],
     [state.levels[2], (index) => [
-      req("Arabic", 5),
+      req("Arabic", 4),
       req("English", 4),
-      req("Math", 5),
+      req("Math", 4),
       req(index % 2 === 0 ? "Chemistry" : "Biology", 4),
       req(index % 2 === 0 ? "Geography" : "History", 5),
       req("Statistics", 4),
@@ -765,11 +1066,13 @@ function buildDefaultDepartments() {
 // ---------------------------------------------------------------------------
 
 function renderAll() {
+  syncBranchClasses();
   writeGlobalInputs();
   renderLevels();
   renderTeachers();
   renderSubjects();
   renderDepartments();
+  renderBranches();
   renderClasses();
   renderBlockRules();
   renderSession();
@@ -784,6 +1087,34 @@ function writeGlobalInputs() {
   Object.keys(state.constraints).forEach((key) => {
     const input = document.getElementById(key);
     if (input) input.checked = state.constraints[key];
+  });
+  renderConstraintPriorities();
+}
+
+const PRIORITY_TYPES = ["clash", "availability", "unqualified", "classSize", "groupSize", "blocked", "overload", "repeat", "lateCover"];
+
+function renderConstraintPriorities() {
+  if (!els.constraintPriorities) return;
+  els.constraintPriorities.innerHTML = "";
+  PRIORITY_TYPES.forEach((type) => {
+    const field = document.createElement("label");
+    field.className = "field";
+    const span = document.createElement("span");
+    span.textContent = VIOLATION_LABELS[type] || type;
+    const select = document.createElement("select");
+    [["high", "High - protect first"], ["normal", "Normal"], ["low", "Low - break first"]].forEach(([value, label]) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      option.selected = (state.settings.constraintPriorities?.[type] || "normal") === value;
+      select.append(option);
+    });
+    select.addEventListener("change", () => {
+      (state.settings.constraintPriorities ||= {})[type] = select.value;
+      saveToStorage();
+    });
+    field.append(span, select);
+    els.constraintPriorities.append(field);
   });
 }
 
@@ -1027,8 +1358,16 @@ function renderTeachers() {
     populateOptions(subjectSelect, state.subjects.map((subject) => subject.name), teacher.subjects);
     subjectSelect.addEventListener("change", () => {
       teacher.subjects = [...subjectSelect.selectedOptions].map((option) => option.value);
+      Object.keys(teacher.subjectLevels || {}).forEach((subjectName) => {
+        if (!teacher.subjects.includes(subjectName)) delete teacher.subjectLevels[subjectName];
+      });
+      renderTeacherSubjectLevels(card.querySelector(".subject-levels"), teacher);
       saveToStorage();
     });
+    const subjectLevelsWrap = document.createElement("div");
+    subjectLevelsWrap.className = "subject-levels";
+    card.querySelector(".form-grid").after(subjectLevelsWrap);
+    renderTeacherSubjectLevels(subjectLevelsWrap, teacher);
     const replacementSelect = card.querySelector('[data-field="replacements"]');
     populateOptions(
       replacementSelect,
@@ -1052,6 +1391,9 @@ function renderTeachers() {
       state.classes.forEach((klass) => klass.requirements.forEach((requirement) => {
         if (requirement.teacherId === teacher.id) requirement.teacherId = "";
       }));
+      (state.branches || []).forEach((branch) => branch.requirements.forEach((requirement) => {
+        if (requirement.teacherId === teacher.id) requirement.teacherId = "";
+      }));
       state.departments.forEach((department) => {
         if (department.hodTeacherId === teacher.id) department.hodTeacherId = "";
       });
@@ -1062,6 +1404,55 @@ function renderTeachers() {
       renderAll();
     });
     els.teacherList.append(card);
+  });
+}
+
+// Per-subject level scoping on a teacher card. Every teachable subject gets
+// one pill per level; all pills on = teaches the subject in every level
+// (stored as "no restriction"). Same-named subjects across levels are
+// distinct teaching assignments, so scoping is set per subject.
+function renderTeacherSubjectLevels(container, teacher) {
+  if (!container) return;
+  container.innerHTML = "";
+  if (!teacher.subjects.length || state.levels.length < 2) return;
+  const heading = document.createElement("div");
+  heading.className = "mini-heading";
+  heading.textContent = "Levels taught per subject";
+  container.append(heading);
+  const hint = document.createElement("p");
+  hint.className = "hint";
+  hint.textContent = "Science in one level is not the same as Science in another. Untick a level to say this teacher does not teach the subject there.";
+  container.append(hint);
+  teacher.subjects.forEach((subjectName) => {
+    const row = document.createElement("div");
+    row.className = "subject-level-row";
+    const label = document.createElement("strong");
+    label.textContent = subjectName;
+    row.append(label);
+    const allLevelIds = state.levels.map((level) => level.id);
+    const restriction = teacher.subjectLevels?.[subjectName];
+    const allowed = Array.isArray(restriction) ? restriction : allLevelIds;
+    state.levels.forEach((level) => {
+      const pill = document.createElement("label");
+      pill.className = "day-pill level-pill";
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = allowed.includes(level.id);
+      input.addEventListener("change", () => {
+        const current = Array.isArray(teacher.subjectLevels?.[subjectName]) ? teacher.subjectLevels[subjectName] : [...allLevelIds];
+        const next = input.checked ? [...new Set([...current, level.id])] : current.filter((id) => id !== level.id);
+        teacher.subjectLevels ||= {};
+        if (next.length === allLevelIds.length) {
+          delete teacher.subjectLevels[subjectName];
+        } else {
+          teacher.subjectLevels[subjectName] = next;
+        }
+        saveToStorage();
+      });
+      pill.append(input, document.createTextNode(level.name));
+      row.append(pill);
+    });
+    container.append(row);
   });
 }
 
@@ -1094,9 +1485,13 @@ function renderSubjects() {
       state.subjects = state.subjects.filter((item) => item.id !== subject.id);
       state.teachers.forEach((teacher) => {
         teacher.subjects = teacher.subjects.filter((item) => item !== subject.name);
+        if (teacher.subjectLevels) delete teacher.subjectLevels[subject.name];
       });
       state.classes.forEach((klass) => {
         klass.requirements = klass.requirements.filter((item) => item.subject !== subject.name);
+      });
+      (state.branches || []).forEach((branch) => {
+        branch.requirements = branch.requirements.filter((item) => item.subject !== subject.name);
       });
       state.departments.forEach((department) => {
         department.subjectNames = department.subjectNames.filter((item) => item !== subject.name);
@@ -1121,9 +1516,18 @@ function updateSubjectName(subject, value) {
   subject.name = value;
   state.teachers.forEach((teacher) => {
     teacher.subjects = teacher.subjects.map((item) => (item === oldName ? value : item));
+    if (teacher.subjectLevels?.[oldName]) {
+      teacher.subjectLevels[value] = teacher.subjectLevels[oldName];
+      delete teacher.subjectLevels[oldName];
+    }
   });
   state.classes.forEach((klass) => {
     klass.requirements.forEach((requirement) => {
+      if (requirement.subject === oldName) requirement.subject = value;
+    });
+  });
+  (state.branches || []).forEach((branch) => {
+    branch.requirements.forEach((requirement) => {
       if (requirement.subject === oldName) requirement.subject = value;
     });
   });
@@ -1195,6 +1599,7 @@ function renderClasses() {
     return;
   }
   const card = template.content.firstElementChild.cloneNode(true);
+  const branch = klass.branchId ? branchById(klass.branchId) : null;
   bindInput(card, "name", klass.name, (value) => {
     klass.name = value;
     renderClassPickers();
@@ -1207,16 +1612,194 @@ function renderClasses() {
     normalizeAvailability();
     renderAll();
   });
-  card.querySelector(".remove-entity").addEventListener("click", () => {
-    state.classes = state.classes.filter((item) => item.id !== klass.id);
-    state.selectedClassId = state.classes[0]?.id || "";
-    renderAll();
-  });
+  if (branch) {
+    card.querySelector('[data-field="name"]').disabled = true;
+    levelSelect.disabled = true;
+    card.querySelector(".remove-entity").classList.add("hidden");
+    const size = (klass.composition || []).reduce((sum, part) => sum + part.students, 0);
+    const parts = (klass.composition || []).map((part) => `${branchById(part.branchId)?.name || "?"} ${part.students}`).join(" + ");
+    const notice = document.createElement("p");
+    notice.className = "hint branch-notice";
+    notice.textContent = `Auto-formed class: ${size} students (${parts}). Subjects are managed on the Branches tab; common subjects are attended together, and partial-taker subjects run as co-timed choice groups shared across classes.`;
+    card.querySelector(".entity-card-header").after(notice);
+  } else {
+    card.querySelector(".remove-entity").addEventListener("click", () => {
+      state.classes = state.classes.filter((item) => item.id !== klass.id);
+      state.selectedClassId = state.classes[0]?.id || "";
+      renderAll();
+    });
+  }
   card.querySelector(".block-slots-btn").addEventListener("click", () => {
     toggleBlockedGrid(card, klass);
   });
-  renderRequirements(card.querySelector(".requirements"), klass);
+  const mixed = (klass.composition || []).length > 1;
+  if (branch && mixed) {
+    const summary = document.createElement("p");
+    summary.className = "hint";
+    summary.textContent = "This class mixes branches, so its subjects come from each branch's plan. Edit them per branch in the Branches tab.";
+    card.querySelector(".requirements").append(summary);
+  } else {
+    const owner = branch
+      ? { key: branch.id, levelId: klass.levelId, requirements: branch.requirements, branch }
+      : { key: klass.id, levelId: klass.levelId, requirements: klass.requirements };
+    renderRequirements(card.querySelector(".requirements"), owner);
+  }
   els.classList.append(card);
+}
+
+function renderBranches() {
+  if (!els.branchList) return;
+  ensureSelectedLevel();
+  populateOptions(els.branchLevelPicker, state.levels.map((level) => level.id), [state.selectedLevelId], (id) => levelById(id)?.name || id);
+  els.branchList.innerHTML = "";
+  const level = selectedLevel();
+  if (!level) return;
+
+  const settings = document.createElement("article");
+  settings.className = "entity-card branch-card";
+  const settingsHeading = document.createElement("div");
+  settingsHeading.className = "mini-heading";
+  settingsHeading.textContent = `${level.name} - class formation settings`;
+  settings.append(settingsHeading);
+  const settingsHint = document.createElement("p");
+  settingsHint.className = "hint";
+  settingsHint.textContent = "Branches declare students, not classes. The program packs students into this many classes, keeping every class (and every choice-subject student group) between the minimum and maximum. Breaches are flagged on generated schedules; a group below the minimum is only accepted when the subject's total takers are below it.";
+  settings.append(settingsHint);
+  const settingsGrid = document.createElement("div");
+  settingsGrid.className = "form-grid three";
+  const bindLevelNumber = (label, field, min, max) => {
+    const input = numberInput(level[field] || 0, min, max, (value) => {
+      level[field] = value;
+      syncBranchClasses();
+      normalizeAvailability();
+      renderAll();
+    });
+    return fieldWrap(label, input);
+  };
+  settingsGrid.append(
+    bindLevelNumber("Classes In Level (0 = auto)", "classCount", 0, 60),
+    bindLevelNumber("Min Students Per Class (0 = off)", "minClassSize", 0, 200),
+    bindLevelNumber("Max Students Per Class (0 = off)", "maxClassSize", 0, 200),
+  );
+  settings.append(settingsGrid);
+  els.branchList.append(settings);
+
+  const branches = (state.branches || []).filter((branch) => branch.levelId === level.id);
+  if (!branches.length) {
+    els.branchList.insertAdjacentHTML("beforeend", `<div class="empty-state"><h4>No branches for ${escapeHtml(level.name)}</h4><p>Branches split a level into streams (e.g. Science, Art, Math), each with its own students and subjects. Add one, set its student count and subjects, and the classes are formed automatically.</p></div>`);
+    return;
+  }
+
+  branches.forEach((branch) => {
+    const card = document.createElement("article");
+    card.className = "entity-card branch-card";
+    const header = document.createElement("div");
+    header.className = "entity-card-header";
+    const nameField = fieldWrap("Branch Name", textInput(branch.name, (value) => {
+      branch.name = value || branch.name;
+      syncBranchClasses();
+      renderAll();
+    }));
+    nameField.classList.add("title-field");
+    const studentsField = fieldWrap("Students", numberInput(branch.studentCount, 0, 2000, (value) => {
+      branch.studentCount = value;
+      syncBranchClasses();
+      normalizeAvailability();
+      renderAll();
+    }));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "ghost remove-entity";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", () => {
+      state.branches = state.branches.filter((item) => item.id !== branch.id);
+      syncBranchClasses();
+      renderAll();
+    });
+    header.append(nameField, studentsField, remove);
+    card.append(header);
+
+    const others = branches.filter((item) => item.id !== branch.id);
+    if (others.length) {
+      const shareSelect = document.createElement("select");
+      shareSelect.multiple = true;
+      populateOptions(shareSelect, others.map((item) => item.id), branch.shareWithBranchIds || [], (id) => branchById(id)?.name || id);
+      shareSelect.addEventListener("change", () => {
+        branch.shareWithBranchIds = [...shareSelect.selectedOptions].map((option) => option.value);
+        syncBranchClasses();
+        normalizeAvailability();
+        renderAll();
+      });
+      const shareField = fieldWrap("May Share Classes With", shareSelect);
+      const shareHint = document.createElement("p");
+      shareHint.className = "hint";
+      shareHint.textContent = "Shared branches can sit in the same class for their common subjects; their partial-taker subjects split into pooled student groups.";
+      card.append(shareField, shareHint);
+    }
+
+    const hint = document.createElement("p");
+    hint.className = "hint";
+    hint.textContent = "Weekly subjects below. \"Students\" on a row = how many of this branch take that subject (empty = all). Partial subjects become co-timed choice groups shared across classes.";
+    card.append(hint);
+    const reqWrap = document.createElement("div");
+    reqWrap.className = "requirements";
+    renderRequirements(reqWrap, { key: branch.id, levelId: branch.levelId, requirements: branch.requirements, branch });
+    card.append(reqWrap);
+    els.branchList.append(card);
+  });
+
+  els.branchList.append(renderFormationSummary(level));
+}
+
+// Read-only summary of what the packer and sectioning plan produced: formed
+// classes with their branch composition, and every choice subject's student
+// groups with size flags.
+function renderFormationSummary(level) {
+  const card = document.createElement("article");
+  card.className = "entity-card branch-card formation-summary";
+  const heading = document.createElement("div");
+  heading.className = "mini-heading";
+  heading.textContent = "Resulting classes and student groups";
+  card.append(heading);
+  const classes = state.classes.filter((klass) => klass.levelId === level.id && klass.branchId);
+  if (!classes.length) {
+    card.insertAdjacentHTML("beforeend", `<p class="hint">No classes formed yet - give branches students first.</p>`);
+    return card;
+  }
+  const list = document.createElement("ul");
+  list.className = "formation-list";
+  classes.forEach((klass) => {
+    const size = (klass.composition || []).reduce((sum, part) => sum + part.students, 0);
+    const parts = (klass.composition || []).map((part) => `${branchById(part.branchId)?.name || "?"} ${part.students}`).join(" + ");
+    const line = document.createElement("li");
+    line.textContent = `${klass.name}: ${size} students (${parts})`;
+    list.append(line);
+  });
+  card.append(list);
+  const plan = levelSectioningPlan(level);
+  if (plan?.choiceSubjects.length) {
+    const groupsHeading = document.createElement("div");
+    groupsHeading.className = "mini-heading";
+    groupsHeading.textContent = `Choice-subject groups (co-timed, ${plan.weekly}x per week)`;
+    card.append(groupsHeading);
+    const groupList = document.createElement("ul");
+    groupList.className = "formation-list";
+    plan.choiceSubjects.forEach((subject) => {
+      subject.groups.forEach((group, index) => {
+        const parts = group.chunks.map((chunk) => `${classById(chunk.classId)?.name || "?"}: ${chunk.students}`).join(", ");
+        const flags = [group.belowMin ? "below minimum" : "", group.aboveMax ? "above maximum" : ""].filter(Boolean).join(", ");
+        const line = document.createElement("li");
+        line.textContent = `${subject.subject} group ${index + 1}: ${group.students} students (${parts})${flags ? ` - ⚠ ${flags}` : ""}`;
+        if (flags) line.className = "formation-warning";
+        groupList.append(line);
+      });
+    });
+    card.append(groupList);
+  }
+  (plan?.warnings || []).forEach((warning) => {
+    card.insertAdjacentHTML("beforeend", `<p class="hint formation-warning">⚠ ${escapeHtml(warning)}</p>`);
+  });
+  return card;
 }
 
 function ensureSelectedClass() {
@@ -1241,7 +1824,11 @@ function renderClassPickers() {
   populateOptions(els.scheduleClassPicker, values, [state.selectedClassId], labeler);
 }
 
-function renderRequirements(container, klass) {
+// Weekly-requirements editor, shared by classes and branches. `owner` is
+// { key, levelId, requirements }. Subjects with a zero count are "not taken"
+// (greyed) and collapse into an expandable list so they can be restored at
+// any time with one click.
+function renderRequirements(container, owner) {
   container.innerHTML = "";
   const heading = document.createElement("div");
   heading.className = "mini-heading";
@@ -1250,60 +1837,91 @@ function renderRequirements(container, klass) {
   const assigned = [];
   const unassigned = [];
   state.subjects.forEach((subject) => {
-    let requirement = klass.requirements.find((item) => item.subject === subject.name);
+    let requirement = owner.requirements.find((item) => item.subject === subject.name);
     if (!requirement) {
       requirement = req(subject.name, 0);
-      klass.requirements.push(requirement);
+      owner.requirements.push(requirement);
     }
     (requirement.count > 0 ? assigned : unassigned).push({ subject, requirement });
   });
-  [...assigned, ...unassigned].forEach(({ subject, requirement }) => {
-    const row = document.createElement("div");
-    row.className = `requirement-row ${requirement.count > 0 ? "" : "zero-row"}`;
-    row.innerHTML = `
-      <label class="field"><span>Subject</span><input value="${escapeAttr(subject.name)}" disabled /></label>
-      <label class="field"><span>Per Week</span><input type="number" min="0" max="20" value="${requirement.count}" /></label>
-      <label class="field"><span>Specific Teacher</span><select></select></label>
-      <label class="field"><span>Grouping</span><select data-role="grouping"></select></label>
-      <label class="field late-field"><span>Late Cover</span><input type="checkbox" ${requirement.possiblyLate ? "checked" : ""} /></label>
-    `;
-    const countInput = row.querySelector('input[type="number"]');
-    const selects = row.querySelectorAll("select");
-    const teacherSelect = selects[0];
-    const groupingSelect = row.querySelector('[data-role="grouping"]');
-    const lateInput = row.querySelector('input[type="checkbox"]');
-    populateOptions(teacherSelect, ["", ...teachersForSubject(subject.name).map((teacher) => teacher.id)], [requirement.teacherId || ""], (value) => {
-      if (!value) return "Any qualified teacher";
-      return state.teachers.find((teacher) => teacher.id === value)?.name || value;
+  assigned.forEach((entry) => container.append(requirementRow(entry, owner)));
+  if (unassigned.length) {
+    const details = document.createElement("details");
+    details.className = "unused-subjects";
+    details.open = Boolean(state.uiOpenUnused?.[owner.key]);
+    details.addEventListener("toggle", () => {
+      (state.uiOpenUnused ||= {})[owner.key] = details.open;
     });
-    const availableRules = (state.groupingRules || []).filter((rule) => rule.subject === subject.name && (!rule.levelId || rule.levelId === klass.levelId));
-    populateOptions(groupingSelect, ["", ...availableRules.map((rule) => rule.id)], [requirement.groupRuleId || ""], (value) => {
-      if (!value) return "No grouping";
-      const rule = groupingRuleById(value);
-      return rule?.groupName || rule?.id || value;
-    });
-    countInput.addEventListener("change", () => {
-      requirement.count = clampNumber(countInput.value, 0, 20, 0);
-      saveToStorage();
-    });
-    teacherSelect.addEventListener("change", () => {
-      requirement.teacherId = teacherSelect.value;
-      saveToStorage();
-    });
-    groupingSelect.addEventListener("change", () => {
-      if (groupingSelect.value) {
-        requirement.groupRuleId = groupingSelect.value;
+    const summary = document.createElement("summary");
+    summary.textContent = `${unassigned.length} subject${unassigned.length === 1 ? "" : "s"} not taken - expand to add or restore`;
+    details.append(summary);
+    unassigned.forEach((entry) => details.append(requirementRow(entry, owner)));
+    container.append(details);
+  }
+}
+
+function requirementRow({ subject, requirement }, owner) {
+  const row = document.createElement("div");
+  row.className = `requirement-row ${owner.branch ? "with-students" : ""} ${requirement.count > 0 ? "" : "zero-row"}`;
+  row.innerHTML = `
+    <label class="field"><span>Subject</span><input value="${escapeAttr(subject.name)}" disabled /></label>
+    <label class="field"><span>Per Week</span><input type="number" min="0" max="20" value="${requirement.count}" /></label>
+    ${owner.branch ? `<label class="field"><span>Students</span><input data-role="students" type="number" min="0" max="2000" placeholder="all" value="${requirement.students || ""}" /></label>` : ""}
+    <label class="field"><span>Specific Teacher</span><select></select></label>
+    <label class="field"><span>Grouping</span><select data-role="grouping"></select></label>
+    <label class="field late-field"><span>Late Cover</span><input type="checkbox" ${requirement.possiblyLate ? "checked" : ""} /></label>
+  `;
+  if (owner.branch) {
+    const studentsInput = row.querySelector('[data-role="students"]');
+    studentsInput.title = "How many of this branch's students take the subject. Empty = all of them. Partial takers are pooled into co-timed choice groups.";
+    studentsInput.addEventListener("change", () => {
+      const value = clampNumber(studentsInput.value, 0, 2000, 0);
+      if (value > 0 && value < Number(owner.branch.studentCount || 0)) {
+        requirement.students = value;
       } else {
-        delete requirement.groupRuleId;
+        delete requirement.students;
       }
-      saveToStorage();
+      syncBranchClasses();
+      renderAll();
     });
-    lateInput.addEventListener("change", () => {
-      requirement.possiblyLate = lateInput.checked;
-      saveToStorage();
-    });
-    container.append(row);
+  }
+  const countInput = row.querySelector('input[type="number"]');
+  const teacherSelect = row.querySelectorAll("select")[0];
+  const groupingSelect = row.querySelector('[data-role="grouping"]');
+  const lateInput = row.querySelector('input[type="checkbox"]');
+  populateOptions(teacherSelect, ["", ...teachersForSubject(subject.name, owner.levelId).map((teacher) => teacher.id)], [requirement.teacherId || ""], (value) => {
+    if (!value) return "Any qualified teacher";
+    return state.teachers.find((teacher) => teacher.id === value)?.name || value;
   });
+  const availableRules = (state.groupingRules || []).filter((rule) => rule.subject === subject.name && (!rule.levelId || rule.levelId === owner.levelId));
+  populateOptions(groupingSelect, ["", ...availableRules.map((rule) => rule.id)], [requirement.groupRuleId || ""], (value) => {
+    if (!value) return "No grouping";
+    const rule = groupingRuleById(value);
+    return rule?.groupName || rule?.id || value;
+  });
+  countInput.addEventListener("change", () => {
+    const wasZero = !(requirement.count > 0);
+    requirement.count = clampNumber(countInput.value, 0, 20, 0);
+    saveToStorage();
+    if (wasZero !== !(requirement.count > 0)) renderAll();
+  });
+  teacherSelect.addEventListener("change", () => {
+    requirement.teacherId = teacherSelect.value;
+    saveToStorage();
+  });
+  groupingSelect.addEventListener("change", () => {
+    if (groupingSelect.value) {
+      requirement.groupRuleId = groupingSelect.value;
+    } else {
+      delete requirement.groupRuleId;
+    }
+    saveToStorage();
+  });
+  lateInput.addEventListener("change", () => {
+    requirement.possiblyLate = lateInput.checked;
+    saveToStorage();
+  });
+  return row;
 }
 
 function toggleBlockedGrid(card, klass) {
@@ -1375,6 +1993,11 @@ function renderBlockRules() {
   });
   header.append(heading, addButton);
   groupCard.append(header);
+
+  const groupHint = document.createElement("p");
+  groupHint.className = "hint";
+  groupHint.textContent = "A grouping rule teaches one subject to several classes together as one combined group. Attach classes from the Classes tab using the Grouping column on that subject's row. The weekly count on the class row IS the grouped teaching - the scheduler never adds separate per-class periods on top, so do not count the subject twice.";
+  groupCard.append(groupHint);
 
   if (!state.groupingRules.length) {
     const empty = document.createElement("p");
@@ -1471,7 +2094,7 @@ function renderElectiveRuleEditor(rule) {
     });
 
     const teacherSelect = document.createElement("select");
-    const pool = option.subject ? teachersForSubject(option.subject) : [];
+    const pool = option.subject ? teachersForSubject(option.subject, rule.levelId) : [];
     populateOptions(teacherSelect, ["", ...pool.map((teacher) => teacher.id)], [option.teacherId || ""], (value) => {
       if (!value) return "Any qualified teacher";
       return state.teachers.find((teacher) => teacher.id === value)?.name || value;
@@ -1735,7 +2358,19 @@ function renderSlotGrid(container, matrix, days, slotCount, positiveDefault, onC
     container.append(labelCell(`P${slot + 1}`));
   }
   days.forEach((day) => {
-    container.append(labelCell(day.slice(0, 3)));
+    const dayCell = labelCell(day.slice(0, 3));
+    dayCell.classList.add("day-toggle");
+    dayCell.title = `Click to toggle all of ${day} on/off`;
+    dayCell.addEventListener("click", () => {
+      const count = slotCountFor ? slotCountFor(day) : slotCount;
+      const anyOn = Array.from({ length: count }, (_, index) => matrix[day]?.[index] ?? positiveDefault).some(Boolean);
+      for (let index = 0; index < count; index++) {
+        if (matrix[day]) matrix[day][index] = !anyOn;
+        onChange(day, index, !anyOn);
+      }
+      renderSlotGrid(container, matrix, days, slotCount, positiveDefault, onChange, onText, offText, slotCountFor);
+    });
+    container.append(dayCell);
     const dayCount = slotCountFor ? slotCountFor(day) : slotCount;
     for (let slot = 0; slot < slotCount; slot++) {
       if (slot >= dayCount) {
@@ -1827,7 +2462,7 @@ function groupedRequirementClassIds(rule) {
   const explicit = (rule.classIds || []).filter((id) => state.classes.some((klass) => klass.id === id));
   if (explicit.length) return explicit;
   return state.classes
-    .filter((klass) => klass.levelId === rule.levelId && klass.requirements.some((requirement) => requirement.groupRuleId === rule.id))
+    .filter((klass) => klass.levelId === rule.levelId && classRequirements(klass).some((requirement) => requirement.groupRuleId === rule.id))
     .map((klass) => klass.id);
 }
 
@@ -1910,7 +2545,7 @@ function classGroupScore(chunks) {
 
 function classWeeklyLoad(classId) {
   const klass = classById(classId);
-  return klass ? klass.requirements.reduce((sum, item) => sum + Number(item.count || 0), 0) : 0;
+  return klass ? classRequirements(klass).reduce((sum, item) => sum + Number(item.count || 0), 0) : 0;
 }
 
 function normalizeAvailability() {
@@ -1987,6 +2622,22 @@ function validateSetup() {
       electiveLoadByClass[classId] = (electiveLoadByClass[classId] || 0) + Number(rule.count || 0);
     });
   });
+  state.levels.forEach((level) => {
+    if (Number(level.minClassSize) > 0 && Number(level.maxClassSize) > 0 && Number(level.minClassSize) > Number(level.maxClassSize)) {
+      messages.push(`${level.name}: minimum students per class is larger than the maximum.`);
+    }
+    const plan = levelSectioningPlan(level);
+    if (!plan) return;
+    messages.push(...plan.warnings);
+    if (plan.weekly > 0) {
+      plan.clusterClassIds.forEach((classId) => {
+        electiveLoadByClass[classId] = (electiveLoadByClass[classId] || 0) + plan.weekly;
+      });
+    }
+  });
+  (state.branches || []).forEach((branch) => {
+    if (!(Number(branch.studentCount) > 0)) messages.push(`Branch ${branch.name}: set the number of students.`);
+  });
   state.classes.forEach((klass) => {
     if (!klass.name.trim()) messages.push("Every class needs a name.");
     const level = levelById(klass.levelId);
@@ -1994,14 +2645,14 @@ function validateSetup() {
       messages.push(`${klass.name} is not assigned to a level.`);
       return;
     }
-    const total = klass.requirements.reduce((sum, item) => sum + Number(item.count || 0), 0) + (electiveLoadByClass[klass.id] || 0);
+    const total = classRequirements(klass).reduce((sum, item) => sum + Number(item.count || 0), 0) + (electiveLoadByClass[klass.id] || 0);
     const capacity = level.days.reduce((sum, day) => sum + periodsForDay(level, day), 0);
     if (total > capacity) messages.push(`${klass.name} needs ${total} periods, but ${level.name} has capacity for ${capacity}.`);
-    klass.requirements.filter((item) => item.count > 0).forEach((item) => {
+    classRequirements(klass).filter((item) => item.count > 0).forEach((item) => {
       const subject = subjectByName(item.subject);
       if (!subject) messages.push(`${klass.name} references a missing subject: ${item.subject}.`);
       if (item.teacherId && !state.teachers.some((teacher) => teacher.id === item.teacherId)) messages.push(`${klass.name} has a missing assigned teacher for ${item.subject}.`);
-      if (!item.teacherId && !teachersForSubject(item.subject).length) messages.push(`${klass.name} cannot schedule ${item.subject}; no teacher can teach it.`);
+      if (!item.teacherId && !teachersForSubject(item.subject, level.id).length) messages.push(`${klass.name} cannot schedule ${item.subject}; no teacher teaches it in ${level.name}.`);
       const exactPattern = level.sessionPatterns?.[item.subject] || [];
       if (exactPattern.length) {
         const patternTotal = exactPattern.reduce((sum, value) => sum + Number(value || 0), 0);
@@ -2045,14 +2696,14 @@ function validateSetup() {
       if (optionSubjects.has(option.subject)) messages.push(`${label}: ${option.subject} is listed twice.`);
       optionSubjects.add(option.subject);
       if (!subjectByName(option.subject)) messages.push(`${label} references a missing subject: ${option.subject}.`);
-      const pool = option.teacherId ? state.teachers.filter((teacher) => teacher.id === option.teacherId) : teachersForSubject(option.subject);
-      if (!pool.length) messages.push(`${label}: no teacher can teach ${option.subject}.`);
+      const pool = option.teacherId ? state.teachers.filter((teacher) => teacher.id === option.teacherId) : teachersForSubject(option.subject, rule.levelId);
+      if (!pool.length) messages.push(`${label}: no teacher teaches ${option.subject} in ${level.name}.`);
     });
     (rule.classIds || []).forEach((classId) => {
       const klass = classById(classId);
       if (!klass) return;
       if (klass.levelId !== rule.levelId) messages.push(`${label}: ${klass.name} is not in ${level.name}.`);
-      klass.requirements.forEach((requirement) => {
+      classRequirements(klass).forEach((requirement) => {
         if (Number(requirement.count || 0) > 0 && optionSubjects.has(requirement.subject)) {
           messages.push(`${klass.name}: remove the separate ${requirement.subject} requirement (${requirement.count}/week) - it is already covered by the elective split "${label}".`);
         }
@@ -2074,6 +2725,7 @@ function showValidation(messages) {
 // ---------------------------------------------------------------------------
 
 function generateSchedules() {
+  syncBranchClasses();
   normalizeAvailability();
   const validation = validateSetup();
   if (!validation.ok) {
@@ -2180,30 +2832,39 @@ function orderTasks(tasks, seed) {
   const tightness = subjectTightnessMap();
   // Elective splits need several teachers plus every listed class free at the
   // same time, so they are the most constrained tasks and go first.
-  const weightOf = (task) => taskWeight(task) + (tightness[task.subject] || 0) + (task.electiveOptions ? 700 : 0);
+  const weightOf = (task) => taskWeight(task)
+    + (tightness[`${task.subject}|${task.levelId}`] ?? tightness[task.subject] ?? 0)
+    + (task.electiveOptions ? 700 : 0);
   return shuffleWithSeed(tasks, seed).sort((a, b) => weightOf(b) - weightOf(a));
 }
 
+// Demand/supply ratio per subject AND per level (teachers can be scoped to
+// levels, so Science supply in one level can differ from another's).
 function subjectTightnessMap() {
   const demand = {};
-  state.classes.forEach((klass) => klass.requirements.forEach((requirement) => {
+  const addDemand = (subject, levelId, count) => {
+    const key = `${subject}|${levelId}`;
+    demand[key] = (demand[key] || 0) + count;
+  };
+  state.classes.forEach((klass) => classRequirements(klass).forEach((requirement) => {
     const expected = expectedWeeklyCount(requirement);
-    if (expected > 0) demand[requirement.subject] = (demand[requirement.subject] || 0) + expected;
+    if (expected > 0) addDemand(requirement.subject, klass.levelId, expected);
   }));
   (state.electiveRules || []).forEach((rule) => {
     (rule.options || []).forEach((option) => {
-      if (option.subject && rule.count > 0) demand[option.subject] = (demand[option.subject] || 0) + Number(rule.count);
+      if (option.subject && rule.count > 0) addDemand(option.subject, rule.levelId, Number(rule.count));
     });
   });
   const days = unionDays().length;
   const map = {};
-  Object.keys(demand).forEach((subject) => {
-    const supply = teachersForSubject(subject).reduce((sum, teacher) => {
+  Object.keys(demand).forEach((key) => {
+    const [subject, levelId] = key.split("|");
+    const supply = teachersForSubject(subject, levelId).reduce((sum, teacher) => {
       const share = Math.max(1, teacher.subjects.length);
       return sum + (days * (teacher.maxPerDay || state.settings.maxTeacherPerDay)) / share;
     }, 0);
-    const ratio = supply > 0 ? demand[subject] / supply : 2;
-    map[subject] = ratio * 400;
+    const ratio = supply > 0 ? demand[key] / supply : 2;
+    map[key] = ratio * 400;
   });
   return map;
 }
@@ -2214,18 +2875,21 @@ function expandTasks(seed = 0) {
   state.classes.forEach((klass) => {
     const level = levelById(klass.levelId);
     if (!level) return;
-    klass.requirements.forEach((requirement) => {
+    // With "honor fixed teacher assignments" off, teacher-class pairing
+    // becomes a pure solver decision (any qualified teacher, chosen for fit).
+    const honorFixed = state.constraints.honorFixedTeachers !== false;
+    classRequirements(klass).forEach((requirement) => {
       if (Number(requirement.count || 0) <= 0) return;
       const rule = requirement.groupRuleId ? groupingRuleById(requirement.groupRuleId) : null;
       if (rule && rule.mode !== "none") {
-        const teacherId = rule.teacherId || requirement.teacherId || "";
+        const teacherId = honorFixed ? (rule.teacherId || requirement.teacherId || "") : "";
         const key = `${rule.id}::${teacherId}::${requirement.subject}::${level.id}`;
         if (!grouped.has(key)) {
           grouped.set(key, { rule, level, requirement, teacherId, classIds: [] });
         }
         grouped.get(key).classIds.push(klass.id);
       } else {
-        appendRequirementTasks(tasks, level, requirement, [klass.id], requirement.teacherId || "", null, 0);
+        appendRequirementTasks(tasks, level, requirement, [klass.id], honorFixed ? (requirement.teacherId || "") : "", null, 0);
       }
     });
   });
@@ -2260,6 +2924,43 @@ function expandTasks(seed = 0) {
         possiblyLate: false,
         length: 1,
         occurrence,
+        weeklyTotal: rule.count,
+        groupRuleId: "",
+        teachingGroupIndex: 0,
+      });
+    }
+  });
+  // Choice subjects from the branch sectioning plan: every occurrence places
+  // ALL teaching groups of ALL choice subjects simultaneously (one teacher
+  // per group), while every cluster class shows one combined choice block.
+  state.levels.forEach((level) => {
+    const plan = levelSectioningPlan(level);
+    if (!plan || !plan.choiceSubjects.length || !plan.clusterClassIds.length || !(plan.weekly > 0)) return;
+    const classNames = classNamesForIds(plan.clusterClassIds);
+    const subjectNames = [...new Set(plan.choiceSubjects.map((subject) => subject.subject))];
+    const options = plan.choiceSubjects.flatMap((subject) => subject.groups.map((group, groupIndex) => ({
+      subject: subject.subject,
+      teacherId: "",
+      groupIndex,
+      students: group.students,
+    })));
+    if (!options.length) return;
+    for (let occurrence = 1; occurrence <= plan.weekly; occurrence++) {
+      tasks.push({
+        classId: plan.clusterClassIds[0],
+        classIds: plan.clusterClassIds,
+        className: classNames.join(" + "),
+        classNames,
+        levelId: level.id,
+        subject: subjectNames.join(" / "),
+        electiveOptions: options,
+        electiveRuleId: `sec_${level.id}`,
+        sectioning: true,
+        teacherId: "",
+        possiblyLate: false,
+        length: 1,
+        occurrence,
+        weeklyTotal: plan.weekly,
         groupRuleId: "",
         teachingGroupIndex: 0,
       });
@@ -2273,6 +2974,7 @@ function appendRequirementTasks(tasks, level, requirement, classIds, teacherId, 
   const pattern = sessionPatternFor(level, requirement.subject, total);
   pattern.forEach((length, index) => {
     tasks.push({
+      weeklyTotal: total,
       classId: classIds[0],
       classIds,
       className: classNamesForIds(classIds).join(" + "),
@@ -2291,7 +2993,7 @@ function appendRequirementTasks(tasks, level, requirement, classIds, teacherId, 
 
 function taskWeight(task) {
   const subject = subjectByName(task.subject);
-  const qualified = task.teacherId ? 1 : teachersForSubject(task.subject).length;
+  const qualified = task.teacherId ? 1 : teachersForSubject(task.subject, task.levelId).length;
   return task.length * 25 + (subject?.difficulty || 3) * 10 + (subject?.priority === "core" ? 8 : 0) - qualified;
 }
 
@@ -2311,7 +3013,33 @@ function emptySchedule() {
       teacherSlots[teacher.id][day] = Array.from({ length: maxSlots() }, () => null);
     });
   });
-  return { byClass, teacherSlots };
+  return { byClass, teacherSlots, teacherBindings: {} };
+}
+
+// Consistent-teacher binding: once the solver picks a teacher for a class's
+// subject, every later occurrence of that subject in the same class(es) is
+// taught by the same teacher. Bindings are reference-counted so backtracking
+// can release them.
+function bindingKey(task) {
+  const classIds = task.classIds?.length ? task.classIds : [task.classId];
+  return `${[...classIds].sort().join("+")}|${task.subject}`;
+}
+
+function recordBinding(schedule, records, key, teacherId) {
+  const bindings = (schedule.teacherBindings ||= {});
+  const bound = bindings[key];
+  if (bound) {
+    if (bound.teacherId !== teacherId) return;
+    bound.count += 1;
+  } else {
+    bindings[key] = { teacherId, count: 1 };
+  }
+  if (records.length) (records[0].bindingKeys ||= []).push(key);
+}
+
+function boundTeacherId(schedule, key) {
+  if (!state.constraints.consistentTeacher) return "";
+  return schedule.teacherBindings?.[key]?.teacherId || "";
 }
 
 // Depth-first search with backtracking. Placements are tried best-score
@@ -2375,8 +3103,18 @@ function enumeratePlacements(schedule, task, relaxed = false) {
   if (task.teacherId) {
     teachers = state.teachers.filter((teacher) => teacher.id === task.teacherId);
   } else {
-    teachers = teachersForSubject(task.subject);
+    teachers = teachersForSubject(task.subject, task.levelId);
+    if (!teachers.length && relaxed) teachers = teachersForSubject(task.subject);
     if (!teachers.length && relaxed) teachers = state.teachers;
+    const bound = boundTeacherId(schedule, bindingKey(task));
+    if (bound) {
+      teachers = teachers.filter((teacher) => teacher.id === bound);
+    } else if (state.constraints.consistentTeacher && !relaxed) {
+      // Establishing a week-long binding: the teacher must have enough free
+      // weekly capacity for this class's WHOLE weekly count of the subject,
+      // or later occurrences are doomed. Prunes infeasible bin-packings early.
+      teachers = teachers.filter((teacher) => teacherWeeklyCapacityOk(schedule, teacher, task.weeklyTotal || task.length));
+    }
   }
   const patternLocked = Boolean(level.sessionPatterns?.[task.subject]?.length);
   level.days.forEach((day) => {
@@ -2413,11 +3151,27 @@ function enumeratePlacements(schedule, task, relaxed = false) {
   return placements;
 }
 
+function teacherWeeklyLoad(schedule, teacherId) {
+  const days = schedule.teacherSlots[teacherId] || {};
+  let load = 0;
+  Object.keys(days).forEach((day) => {
+    load += days[day].filter(Boolean).length;
+  });
+  return load;
+}
+
+function teacherWeeklyCapacityOk(schedule, teacher, needed) {
+  const days = Object.keys(schedule.teacherSlots[teacher.id] || {});
+  const maxTeacher = teacher.maxPerDay || state.settings.maxTeacherPerDay;
+  return teacherWeeklyLoad(schedule, teacher.id) + needed <= days.length * maxTeacher;
+}
+
 function evaluateTeacherPlacement(schedule, task, teacher, day, slot, relaxed, repeatBroken, blockedSlots) {
   const violations = [];
-  if (state.constraints.requireQualifiedTeacher && !teacher.subjects.includes(task.subject)) {
+  if (state.constraints.requireQualifiedTeacher && !teacherTeachesSubjectAtLevel(teacher, task.subject, task.levelId)) {
     if (!relaxed) return null;
-    violations.push(violation("unqualified", `${teacher.name} is not qualified to teach ${task.subject}.`));
+    const levelName = task.levelId ? levelById(task.levelId)?.name : "";
+    violations.push(violation("unqualified", `${teacher.name} is not qualified to teach ${task.subject}${levelName ? ` in ${levelName}` : ""}.`));
   }
   const teacherDay = schedule.teacherSlots[teacher.id]?.[day];
   if (!teacherDay) return null;
@@ -2507,9 +3261,14 @@ function enumerateElectivePlacements(schedule, task, relaxed = false) {
       for (const option of task.electiveOptions) {
         let pool = (option.teacherId
           ? state.teachers.filter((teacher) => teacher.id === option.teacherId)
-          : teachersForSubject(option.subject)).filter((teacher) => !used.has(teacher.id));
+          : teachersForSubject(option.subject, task.levelId)).filter((teacher) => !used.has(teacher.id));
+        if (!pool.length && relaxed) pool = teachersForSubject(option.subject).filter((teacher) => !used.has(teacher.id));
         if (!pool.length && relaxed) pool = state.teachers.filter((teacher) => !used.has(teacher.id));
-        const optionTask = { subject: option.subject, className: task.className, length: 1, possiblyLate: false, teacherId: option.teacherId || "" };
+        if (!option.teacherId) {
+          const bound = boundTeacherId(schedule, `elx:${task.electiveRuleId}|${option.subject}#${option.groupIndex || 0}`);
+          if (bound) pool = pool.filter((teacher) => teacher.id === bound);
+        }
+        const optionTask = { subject: option.subject, className: task.className, levelId: task.levelId, length: 1, possiblyLate: false, teacherId: option.teacherId || "" };
         let best = null;
         for (const teacher of pool) {
           const evaluated = evaluateTeacherPlacement(schedule, optionTask, teacher, day, slot, relaxed, false, []);
@@ -2523,7 +3282,7 @@ function enumerateElectivePlacements(schedule, task, relaxed = false) {
           break;
         }
         used.add(best.teacher.id);
-        optionTeachers.push({ subject: option.subject, teacherId: best.teacher.id });
+        optionTeachers.push({ subject: option.subject, teacherId: best.teacher.id, groupIndex: option.groupIndex || 0, students: option.students || 0 });
         violations.push(...best.evaluated.violations);
       }
       if (!feasible) continue;
@@ -2555,6 +3314,9 @@ function placementScore(schedule, task, placement, seed) {
   score += dayDifficulty * (subject?.difficulty || 3) * 2;
   if (state.constraints.balanceTeacherLoad) {
     score += teacherDay.filter(Boolean).length * 9;
+    // Weekly balance spreads classes across the qualified teachers, which is
+    // what keeps tight subjects packable under week-long teacher bindings.
+    score += teacherWeeklyLoad(schedule, placement.teacherId) * 1.2;
   }
   if (state.constraints.avoidClassGaps) {
     classDays.forEach((dayGrid) => {
@@ -2601,6 +3363,9 @@ function applyTask(schedule, task, placement) {
     commitLesson(schedule, lesson, placement.day, placement.slot + index);
     records.push({ day: placement.day, slot: placement.slot + index, lesson });
   }
+  if (state.constraints.consistentTeacher && !task.teacherId) {
+    recordBinding(schedule, records, bindingKey(task), placement.teacherId);
+  }
   return records;
 }
 
@@ -2608,10 +3373,10 @@ function applyTask(schedule, task, placement) {
 // hold the combined "German / French" lesson; each option's teacher gets a
 // per-subject copy in their own grid (written by commitLesson via `parts`).
 function applyElectiveTask(schedule, task, placement) {
-  const parts = placement.optionTeachers.map(({ subject, teacherId }) => {
+  const parts = placement.optionTeachers.map(({ subject, teacherId, groupIndex, students }) => {
     const teacher = state.teachers.find((item) => item.id === teacherId);
     const subjectDef = subjectByName(subject);
-    return { subject, teacherId, teacherName: teacher?.name || "", color: subjectDef?.color || "#4a5568" };
+    return { subject, teacherId, teacherName: teacher?.name || "", color: subjectDef?.color || "#4a5568", groupIndex: groupIndex || 0, students: students || 0 };
   });
   const lesson = {
     id: uid("les"),
@@ -2620,10 +3385,10 @@ function applyElectiveTask(schedule, task, placement) {
     classIds: task.classIds,
     className: task.className,
     classNames: task.classNames,
-    subject: parts.map((part) => part.subject).join(" / "),
+    subject: [...new Set(parts.map((part) => part.subject))].join(" / "),
     parts,
     teacherId: parts[0].teacherId,
-    teacherName: parts.map((part) => `${part.teacherName} (${part.subject})`).join(", "),
+    teacherName: parts.map((part) => `${part.teacherName} (${part.subject}${part.students ? `, ${part.students} st.` : ""})`).join(", "),
     requiredTeacherId: "",
     replacementIds: [],
     replacementNames: [],
@@ -2635,7 +3400,14 @@ function applyElectiveTask(schedule, task, placement) {
     electiveRuleId: task.electiveRuleId,
   };
   commitLesson(schedule, lesson, placement.day, placement.slot);
-  return [{ day: placement.day, slot: placement.slot, lesson }];
+  const records = [{ day: placement.day, slot: placement.slot, lesson }];
+  if (state.constraints.consistentTeacher) {
+    placement.optionTeachers.forEach(({ subject, teacherId, groupIndex }, index) => {
+      if (task.electiveOptions[index]?.teacherId) return;
+      recordBinding(schedule, records, `elx:${task.electiveRuleId}|${subject}#${groupIndex || 0}`, teacherId);
+    });
+  }
+  return records;
 }
 
 function lessonTeacherIds(lesson) {
@@ -2643,6 +3415,12 @@ function lessonTeacherIds(lesson) {
 }
 
 function undoTask(schedule, records) {
+  (records[0]?.bindingKeys || []).forEach((key) => {
+    const bound = schedule.teacherBindings?.[key];
+    if (!bound) return;
+    bound.count -= 1;
+    if (bound.count <= 0) delete schedule.teacherBindings[key];
+  });
   records.forEach(({ day, slot, lesson }) => {
     (lesson.classIds?.length ? lesson.classIds : [lesson.classId]).forEach((classId) => {
       const grid = schedule.byClass[classId]?.[day];
@@ -2761,6 +3539,8 @@ const VIOLATION_WEIGHTS = {
   clash: 50,
   unqualified: 40,
   extra: 30,
+  classSize: 22,
+  groupSize: 18,
   availability: 14,
   blocked: 12,
   overload: 10,
@@ -2773,6 +3553,8 @@ const VIOLATION_LABELS = {
   clash: "Teacher double-booked",
   unqualified: "Unqualified teacher",
   extra: "Extra lessons",
+  classSize: "Class size out of bounds",
+  groupSize: "Student group size out of bounds",
   availability: "Teacher availability broken",
   blocked: "Blocked class slot used",
   overload: "Daily teacher load exceeded",
@@ -2780,8 +3562,20 @@ const VIOLATION_LABELS = {
   lateCover: "Late cover not guaranteed",
 };
 
+// User-configurable importance per constraint type. Priorities scale the
+// base weights, steering the fallback toward breaking low-priority
+// constraints first. Ranking always prefers fewer broken constraints overall,
+// regardless of score.
+const VIOLATION_PRIORITY_FACTORS = { high: 3, normal: 1, low: 0.4 };
+
+function violationWeightFor(type) {
+  const base = VIOLATION_WEIGHTS[type] || 5;
+  const priority = state.settings.constraintPriorities?.[type] || "normal";
+  return Math.max(1, Math.round(base * (VIOLATION_PRIORITY_FACTORS[priority] ?? 1)));
+}
+
 function violation(type, text, lessonIds = []) {
-  return { type, text, weight: VIOLATION_WEIGHTS[type] || 5, lessonIds };
+  return { type, text, weight: violationWeightFor(type), lessonIds };
 }
 
 function expectedWeeklyCount(requirement) {
@@ -2816,9 +3610,9 @@ function computeScheduleViolations(schedule) {
           distinctLessons.push({ lesson, day, slot });
           // An elective split is one lesson for the class but a separate
           // teaching duty (own subject) for each option's teacher.
-          const duties = lesson.parts?.length
+          const duties = (lesson.parts?.length
             ? lesson.parts.map((part) => ({ ...lesson, subject: part.subject, teacherId: part.teacherId, teacherName: part.teacherName }))
-            : [lesson];
+            : [lesson]).map((duty) => ({ ...duty, levelId: level.id }));
           duties.forEach((duty) => {
             if (!duty.teacherId) return;
             if (!teacherLoad.has(duty.teacherId)) teacherLoad.set(duty.teacherId, new Map());
@@ -2837,7 +3631,7 @@ function computeScheduleViolations(schedule) {
         }
       });
     });
-    klass.requirements.forEach((requirement) => {
+    classRequirements(klass).forEach((requirement) => {
       const expected = expectedWeeklyCount(requirement);
       if (!expected) return;
       const actual = weeklyCounts[requirement.subject] || 0;
@@ -2871,6 +3665,47 @@ function computeScheduleViolations(schedule) {
     });
   });
 
+  // Branch sectioning: class sizes, student-group sizes (min is exempt only
+  // when the subject's total takers are below it), and choice-block counts.
+  state.levels.forEach((level) => {
+    const plan = levelSectioningPlan(level);
+    if (!plan) return;
+    plan.classSizeIssues.forEach((issue) => {
+      const klass = classById(issue.classId);
+      if (!klass) return;
+      items.push(violation("classSize", issue.kind === "max"
+        ? `${klass.name} has ${issue.size} students (maximum ${issue.limit}).`
+        : `${klass.name} has ${issue.size} students (minimum ${issue.limit}).`));
+    });
+    plan.choiceSubjects.forEach((subject) => {
+      subject.groups.forEach((group, groupIndex) => {
+        if (group.aboveMax) {
+          items.push(violation("groupSize", `${level.name} ${subject.subject} group ${groupIndex + 1} has ${group.students} students (maximum ${level.maxClassSize}).`));
+        }
+        if (group.belowMin) {
+          items.push(violation("groupSize", `${level.name} ${subject.subject} group ${groupIndex + 1} has ${group.students} students (minimum ${level.minClassSize}; ${subject.totalTakers} take the subject in total).`));
+        }
+      });
+    });
+    if (plan.weekly > 0 && plan.clusterClassIds.length) {
+      plan.clusterClassIds.forEach((classId) => {
+        const klass = classById(classId);
+        if (!klass) return;
+        const grid = schedule.byClass[classId] || {};
+        let actual = 0;
+        level.days.forEach((day) => (grid[day] || []).forEach((lesson) => {
+          if (lesson?.electiveRuleId === `sec_${level.id}`) actual += 1;
+        }));
+        if (actual < plan.weekly) {
+          items.push(violation("missing", `${klass.name}: only ${actual} of ${plan.weekly} weekly choice-subject period${plan.weekly === 1 ? "" : "s"} could be placed.`));
+        }
+        if (actual > plan.weekly) {
+          items.push(violation("extra", `${klass.name}: choice-subject block scheduled ${actual} times but only ${plan.weekly} are required.`));
+        }
+      });
+    }
+  });
+
   teacherLoad.forEach((byDay, teacherId) => {
     const teacher = state.teachers.find((item) => item.id === teacherId);
     if (!teacher) return;
@@ -2888,14 +3723,16 @@ function computeScheduleViolations(schedule) {
         }
         if (state.constraints.requireQualifiedTeacher) {
           lessons.forEach((lesson) => {
-            if (!teacher.subjects.includes(lesson.subject)) {
-              items.push(violation("unqualified", `${teacher.name} is not qualified to teach ${lesson.subject} (${lesson.className}, ${day} P${slot + 1}).`, [lesson.id]));
+            if (!teacherTeachesSubjectAtLevel(teacher, lesson.subject, lesson.levelId || "")) {
+              const levelName = lesson.levelId ? levelById(lesson.levelId)?.name : "";
+              items.push(violation("unqualified", `${teacher.name} is not qualified to teach ${lesson.subject}${levelName ? ` in ${levelName}` : ""} (${lesson.className}, ${day} P${slot + 1}).`, [lesson.id]));
             }
           });
         }
       });
       if (dayCount > maxTeacher) {
-        items.push(violation("overload", `${teacher.name} teaches ${dayCount} periods on ${day} (daily limit ${maxTeacher}).`));
+        const dayLessonIds = [...bySlot.values()].flat().map((lesson) => lesson.id);
+        items.push(violation("overload", `${teacher.name} teaches ${dayCount} periods on ${day} (daily limit ${maxTeacher}).`, dayLessonIds));
       }
     });
   });
@@ -3583,6 +4420,7 @@ function moveDraggedLesson(collection, day, slot) {
   if (!drag || !canDropOn(collection)) return;
   const schedule = state.schedules[state.selectedSchedule];
   if (!schedule) return;
+  const before = schedule.violations?.length || 0;
   const error = attemptMoveOrSwap(schedule, drag.lessonId, day, slot, collection);
   if (error) {
     showAlerts([{ type: "error", text: error }]);
@@ -3591,6 +4429,7 @@ function moveDraggedLesson(collection, day, slot) {
   refreshScheduleMeta(schedule);
   renderSchedules();
   saveToStorage();
+  reportManualEdit(schedule, before, "Lesson moved.");
 }
 
 // Click-to-move: started from the lesson dialog's Move / Swap button. The
@@ -3626,6 +4465,7 @@ function handleSlotClick(collection, day, slot, lesson) {
     cancelMoveLesson();
     return true;
   }
+  const before = schedule.violations?.length || 0;
   const error = attemptMoveOrSwap(schedule, state.moveSource.lessonId, day, slot, collection);
   if (error) {
     showAlerts([{ type: "error", text: `${error} Pick another slot, or press Esc to cancel.` }]);
@@ -3635,12 +4475,14 @@ function handleSlotClick(collection, day, slot, lesson) {
   refreshScheduleMeta(schedule);
   renderSchedules();
   saveToStorage();
-  showAlerts([{ type: "success", text: lesson ? "Lessons swapped." : "Lesson moved." }]);
+  reportManualEdit(schedule, before, lesson ? "Lessons swapped." : "Lesson moved.");
   return true;
 }
 
 function openLessonEditor(day, slot, collection, lesson) {
-  state.editTarget = { scheduleIndex: state.selectedSchedule, day, slot, collection, existing: lesson };
+  const editClassId = collection.type === "class" ? collection.id : lesson?.classId || "";
+  const editLevelId = classById(editClassId)?.levelId || "";
+  state.editTarget = { scheduleIndex: state.selectedSchedule, day, slot, collection, existing: lesson, levelId: editLevelId };
   els.moveLessonBtn.classList.toggle("hidden", !lesson);
   // Elective split lessons keep their subjects/teachers as a unit; only the
   // note can be edited. Move/Swap and Clear still work on the whole cell.
@@ -3663,7 +4505,7 @@ function openLessonEditor(day, slot, collection, lesson) {
 
 function refreshTeacherEditOptions(selectedTeacherId) {
   const subject = els.editSubject.value;
-  const teachers = teachersForSubject(subject);
+  const teachers = teachersForSubject(subject, state.editTarget?.levelId || "");
   populateOptions(els.editTeacher, teachers.map((teacher) => teacher.id), [selectedTeacherId || teachers[0]?.id || ""], (value) => state.teachers.find((teacher) => teacher.id === value)?.name || value);
 }
 
@@ -3719,12 +4561,14 @@ function saveEditedLesson() {
     showAlerts([{ type: "error", text: conflict }]);
     return;
   }
+  const before = schedule.violations?.length || 0;
   removeLessonById(schedule, lesson.id);
   commitLesson(schedule, lesson, target.day, target.slot);
   refreshScheduleMeta(schedule);
   els.lessonDialog.close();
   renderSchedules();
   saveToStorage();
+  reportManualEdit(schedule, before, "Lesson saved.");
 }
 
 function clearEditedLesson() {
@@ -3741,6 +4585,11 @@ function clearEditedLesson() {
   saveToStorage();
 }
 
+// Manual edits only refuse what is structurally impossible (missing class,
+// nonexistent period, two lessons in one class cell, reserved cover slots).
+// Anything else - clashes, availability, loads, blocked slots - is allowed
+// and immediately flagged as a broken constraint after the edit, so the
+// admin can make deliberate exceptions.
 function manualConflict(schedule, lesson, day, slot, existingId = "") {
   const classIds = lesson.classIds?.length ? lesson.classIds : [lesson.classId];
   const classes = classIds.map(classById).filter(Boolean);
@@ -3749,32 +4598,27 @@ function manualConflict(schedule, lesson, day, slot, existingId = "") {
   if (!klass || !level) return "The class for this lesson no longer exists.";
   if (!level.days.includes(day) || slot >= periodsForDay(level, day)) return `${klass.name} has no period ${slot + 1} on ${day}.`;
   for (const item of classes) {
-    if (item.blocked[day]?.[slot]) return `${item.name} is blocked in this slot.`;
     const classSlot = schedule.byClass[item.id][day]?.[slot];
     if (classSlot && classSlot.id !== existingId) return `${item.name} already has a lesson in this slot.`;
   }
-  const duties = lesson.parts?.length
-    ? lesson.parts.map((part) => ({ teacherId: part.teacherId, teacherName: part.teacherName }))
-    : [{ teacherId: lesson.teacherId, teacherName: lesson.teacherName }];
-  for (const duty of duties) {
-    const teacherSlot = schedule.teacherSlots[duty.teacherId]?.[day]?.[slot];
-    if (state.constraints.preventTeacherClashes && teacherSlot && teacherSlot.id !== existingId) return `${duty.teacherName} is already teaching ${teacherSlot.className} in this slot.`;
-    const teacher = state.teachers.find((item) => item.id === duty.teacherId);
-    if (state.constraints.honorAvailability && teacher?.availability[day]?.[slot] === false) return `${duty.teacherName} is unavailable in this slot.`;
-    const teacherDailyCount = (schedule.teacherSlots[duty.teacherId]?.[day] || []).filter((item) => item && item.id !== existingId).length;
-    if (teacher && teacherDailyCount >= (teacher.maxPerDay || state.settings.maxTeacherPerDay)) return `${duty.teacherName} has reached the daily teaching limit.`;
-  }
-  if (lesson.possiblyLate && !(lesson.replacementIds || []).length) return `${lesson.teacherName} has no replacement teacher assigned.`;
-  for (const replacementId of lesson.replacementIds || []) {
-    const replacement = state.teachers.find((item) => item.id === replacementId);
-    if (!replacement) continue;
-    const replacementSlot = schedule.teacherSlots[replacement.id]?.[day]?.[slot];
-    if (state.constraints.preventTeacherClashes && replacementSlot && replacementSlot.id !== existingId) return `${replacement.name} is already occupied and cannot cover this possibly late lesson.`;
-    if (state.constraints.honorAvailability && replacement.availability[day]?.[slot] === false) return `${replacement.name} is unavailable and cannot cover this possibly late lesson.`;
-    const replacementDailyCount = (schedule.teacherSlots[replacement.id]?.[day] || []).filter((item) => item && item.id !== existingId).length;
-    if (replacementDailyCount >= (replacement.maxPerDay || state.settings.maxTeacherPerDay)) return `${replacement.name} has reached the daily teaching limit and cannot cover this lesson.`;
-  }
   return "";
+}
+
+// After a manual edit, tell the user exactly how the broken-constraint count
+// changed instead of blocking the edit.
+function reportManualEdit(schedule, beforeCount, successText) {
+  const after = schedule.violations?.length || 0;
+  if (after > beforeCount) {
+    const added = after - beforeCount;
+    showAlerts([{ type: "error", text: `${successText} It breaks ${added} constraint${added === 1 ? "" : "s"} - see the list above the timetable (the affected lessons are outlined red).` }]);
+  } else if (after < beforeCount) {
+    const fixed = beforeCount - after;
+    showAlerts([{ type: "success", text: `${successText} ${fixed} broken constraint${fixed === 1 ? "" : "s"} fixed${after ? `; ${after} remaining` : " - all constraints now met"}.` }]);
+  } else if (after > 0) {
+    showAlerts([{ type: "", text: `${successText} ${after} broken constraint${after === 1 ? "" : "s"} remain unchanged.` }]);
+  } else {
+    showAlerts([{ type: "success", text: successText }]);
+  }
 }
 
 function findLessonById(schedule, id) {
@@ -4062,8 +4906,20 @@ function zipStore(files) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function teachersForSubject(subjectName) {
-  return state.teachers.filter((teacher) => teacher.subjects.includes(subjectName));
+// Whether a teacher may teach a subject in a specific level. Subjects with
+// the same name across levels are distinct teaching assignments: a teacher
+// qualified for First Secondary Science is not automatically qualified for
+// Second Secondary Science if their scoping says otherwise.
+function teacherTeachesSubjectAtLevel(teacher, subjectName, levelId = "") {
+  if (!teacher.subjects.includes(subjectName)) return false;
+  if (!levelId) return true;
+  const allowed = teacher.subjectLevels?.[subjectName];
+  if (!Array.isArray(allowed)) return true;
+  return allowed.includes(levelId);
+}
+
+function teachersForSubject(subjectName, levelId = "") {
+  return state.teachers.filter((teacher) => teacherTeachesSubjectAtLevel(teacher, subjectName, levelId));
 }
 
 function classById(id) {
@@ -4114,6 +4970,7 @@ function saveToStorage() {
     teachers: state.teachers,
     classes: state.classes,
     departments: state.departments,
+    branches: state.branches,
     groupingRules: state.groupingRules,
     electiveRules: state.electiveRules,
     schedules: state.schedules,
@@ -4179,7 +5036,7 @@ function loadFromStorage() {
     const data = JSON.parse(raw);
     if (!Array.isArray(data.levels) || !data.levels.length) return false;
     const knownConstraints = Object.keys(state.constraints);
-    state.settings = Object.assign({ candidateLimit: 12, maxTeacherPerDay: 6, maxSubjectPerDay: 1 }, data.settings || {});
+    state.settings = Object.assign({ candidateLimit: 12, maxTeacherPerDay: 6, maxSubjectPerDay: 1, constraintPriorities: {} }, data.settings || {});
     state.constraints = Object.fromEntries(knownConstraints.map((key) => [key, data.constraints?.[key] ?? true]));
     state.levels = data.levels.map((level) => {
       const hydrated = Object.assign(createLevel(level.name || "Level"), level);
@@ -4193,6 +5050,7 @@ function loadFromStorage() {
     state.teachers = data.teachers || [];
     state.classes = data.classes || [];
     state.departments = data.departments || [];
+    state.branches = (data.branches || []).map((branch) => createBranch(branch.name || "Branch", branch.levelId || "", branch));
     state.groupingRules = (data.groupingRules || []).map((rule) => createGroupingRule(rule));
     state.electiveRules = (data.electiveRules || []).map((rule) => createElectiveRule(rule));
     state.schedules = (data.schedules || []).map((schedule) => {
@@ -4215,6 +5073,7 @@ function loadFromStorage() {
     });
     state.teachers.forEach((teacher) => {
       teacher.replacementIds ||= [];
+      teacher.subjectLevels ||= {};
     });
     state.classes.forEach((klass) => {
       klass.requirements ||= [];
@@ -4222,6 +5081,7 @@ function loadFromStorage() {
         requirement.possiblyLate = Boolean(requirement.possiblyLate);
       });
     });
+    syncBranchClasses();
     normalizeAvailability();
     ensureSelectedLevel();
     ensureSelectedClass();
@@ -4954,6 +5814,24 @@ function applyImport(parsed) {
     const teacher = createTeacher(item.name, item.subjects);
     item.id = teacher.id;
     return teacher;
+  });
+  // The workbook lists assignments per level, so scope each teacher's
+  // subjects to the levels they actually teach them in (same-named subjects
+  // in other levels stay off unless the sheet says otherwise).
+  parsed.teachers.forEach((item) => {
+    const teacher = state.teachers.find((entry) => entry.id === item.id);
+    if (!teacher) return;
+    const levelsBySubject = {};
+    item.assignments.forEach((assignment) => {
+      const levelId = levelIdByName(assignment.level);
+      if (!levelId || !assignment.subject) return;
+      (levelsBySubject[assignment.subject] ||= new Set()).add(levelId);
+    });
+    Object.entries(levelsBySubject).forEach(([subjectName, levels]) => {
+      if (levels.size && levels.size < state.levels.length) {
+        teacher.subjectLevels[subjectName] = [...levels];
+      }
+    });
   });
   const teacherIdByName = new Map(state.teachers.map((teacher) => [teacher.name.toLowerCase(), teacher.id]));
   state.teachers.forEach((teacher) => {

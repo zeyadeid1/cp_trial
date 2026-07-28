@@ -22,6 +22,7 @@
           <button class="nav-item" data-section="teachers">Teachers</button>
           <button class="nav-item" data-section="subjects">Subjects</button>
           <button class="nav-item" data-section="departments">Departments</button>
+          <button class="nav-item" data-section="branches">Branches</button>
           <button class="nav-item" data-section="classes">Classes</button>
           <button class="nav-item" data-section="constraints">Constraints</button>
         </nav>
@@ -176,6 +177,23 @@
           <div id="departmentList" class="entity-list compact"></div>
         </section>
 
+        <section id="branches" class="panel-section">
+          <div class="section-heading">
+            <div>
+              <h3>Branches (Streams)</h3>
+              <p>A level can split into branches such as Science, Art, or Math - each with its own subject plan. Branches with the same name in different levels are completely separate. You only set how many classes a branch has; the class objects are created and assigned automatically.</p>
+            </div>
+            <div class="section-actions">
+              <label class="field class-select-field">
+                <span>Level</span>
+                <select id="branchLevelPicker"></select>
+              </label>
+              <button id="addBranchBtn" class="secondary">Add Branch</button>
+            </div>
+          </div>
+          <div id="branchList" class="entity-list"></div>
+        </section>
+
         <section id="classes" class="panel-section">
           <div class="section-heading">
             <div>
@@ -216,6 +234,16 @@
               <span>Require qualified teacher</span>
               <small>Teachers must be assigned to subjects they can teach.</small>
             </label>
+            <label class="check-card hard">
+              <input id="consistentTeacher" type="checkbox" checked />
+              <span>Same teacher all week</span>
+              <small>Each class keeps one teacher per subject across the whole week.</small>
+            </label>
+            <label class="check-card">
+              <input id="honorFixedTeachers" type="checkbox" checked />
+              <span>Honor fixed teacher picks</span>
+              <small>Respect "Specific Teacher" choices. Turn off to let the solver match teachers to classes freely.</small>
+            </label>
             <label class="check-card">
               <input id="avoidSameSubjectDay" type="checkbox" checked />
               <span>Avoid duplicate subjects per day</span>
@@ -252,6 +280,14 @@
               <input id="candidateLimit" type="number" min="1" max="80" value="12" title="How many candidate schedules to keep. Also caps how many best-effort schedules are shown when no perfect timetable exists." />
             </label>
           </div>
+
+          <div class="section-heading">
+            <div>
+              <h3>Constraint Priorities</h3>
+              <p>When no perfect timetable exists, the generator breaks low-priority constraints first and protects high-priority ones. Solutions are always ranked by fewest broken constraints, even over a better overall score.</p>
+            </div>
+          </div>
+          <div id="constraintPriorities" class="priority-grid"></div>
 
           <div class="section-heading">
             <div>

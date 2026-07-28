@@ -22,7 +22,8 @@ const factory = new Function(
   "localStorage",
   "window",
   `${source}
-  return { state, createLevel, createSubject, createTeacher, createClass, createGroupingRule, createElectiveRule, req,
+  return { state, createLevel, createSubject, createTeacher, createClass, createGroupingRule, createElectiveRule, createBranch, req,
+           classRequirements, syncBranchClasses, findLessonById,
            normalizeAvailability, validateSetup, buildCandidateSchedules, computeScheduleViolations,
            placeTasksExact, placeTasksRelaxed, expandTasks, orderTasks, emptySchedule, repairSchedule,
            levelTimes, effectivePeriodLengths, periodsForDay, maxPeriodsForLevel, dayConfig, levelMinPeriod,
@@ -49,6 +50,8 @@ function baseConstraints() {
     honorAvailability: true,
     preventTeacherClashes: true,
     requireQualifiedTeacher: true,
+    consistentTeacher: true,
+    honorFixedTeachers: true,
     avoidSameSubjectDay: true,
     balanceTeacherLoad: true,
     avoidClassGaps: true,
@@ -57,13 +60,14 @@ function baseConstraints() {
 }
 
 function resetState({ settings = {}, levels = [] } = {}) {
-  state.settings = Object.assign({ candidateLimit: 6, maxTeacherPerDay: 6, maxSubjectPerDay: 1 }, settings);
+  state.settings = Object.assign({ candidateLimit: 6, maxTeacherPerDay: 6, maxSubjectPerDay: 1, constraintPriorities: {} }, settings);
   state.constraints = baseConstraints();
   state.levels = levels;
   state.subjects = [];
   state.teachers = [];
   state.classes = [];
   state.departments = [];
+  state.branches = [];
   state.groupingRules = [];
   state.electiveRules = [];
   state.schedules = [];
@@ -110,7 +114,7 @@ function independentProblems(schedule) {
         if (count > app.allowedSubjectPerDay(level, subject)) problems.push(`${klass.name} ${subject} x${count} on ${day}`);
       });
     });
-    klass.requirements.forEach((requirement) => {
+    app.classRequirements(klass).forEach((requirement) => {
       const expected = app.expectedWeeklyCount(requirement);
       if (!expected) return;
       if ((weekly[requirement.subject] || 0) !== expected) {
@@ -550,6 +554,259 @@ console.log("\n9b. Constraint toggles are respected by solver and auditor");
 
   const schedules = app.buildCandidateSchedules();
   check("with availability off, schedule is perfect", schedules.length >= 1 && schedules[0].violations.length === 0, JSON.stringify(schedules[0]?.violations));
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n9c. Consistent teacher: one teacher per class-subject all week");
+{
+  const level = app.createLevel("Consist", { days: ["Sunday", "Monday", "Tuesday", "Wednesday"], periodsPerDay: 2, breakAfter: 0, breakLength: 0 });
+  resetState({ levels: [level], settings: { candidateLimit: 4, maxTeacherPerDay: 6, maxSubjectPerDay: 1 } });
+  state.subjects = [app.createSubject("Math", "Math", "core", "#176b5b", 5)];
+  state.teachers = [app.createTeacher("T1", ["Math"], 6), app.createTeacher("T2", ["Math"], 6)];
+  const klass = app.createClass("C1", level.id);
+  klass.requirements = [app.req("Math", 4)];
+  state.classes = [klass];
+  app.normalizeAvailability();
+
+  const schedules = app.buildCandidateSchedules();
+  check("schedule generated", schedules.length >= 1 && schedules[0].violations.length === 0);
+  const teacherIds = new Set();
+  level.days.forEach((day) => schedules[0].byClass[klass.id][day].forEach((lesson) => {
+    if (lesson) teacherIds.add(lesson.teacherId);
+  }));
+  check("all 4 Math periods share one teacher", teacherIds.size === 1, `teachers used: ${teacherIds.size}`);
+
+  state.constraints.consistentTeacher = false;
+  const loose = app.buildCandidateSchedules();
+  check("with the toggle off, schedules still generate", loose.length >= 1 && loose[0].violations.length === 0);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n9d. Free teacher-class matching when fixed picks are off");
+{
+  const level = app.createLevel("Fit", { days: ["Sunday"], periodsPerDay: 2, breakAfter: 0, breakLength: 0 });
+  resetState({ levels: [level], settings: { candidateLimit: 4, maxTeacherPerDay: 6, maxSubjectPerDay: 2 } });
+  state.subjects = [app.createSubject("Math", "Math", "core", "#176b5b", 5)];
+  const busy = app.createTeacher("Pinned But Unavailable", ["Math"], 6);
+  const free = app.createTeacher("Better Fit", ["Math"], 6);
+  state.teachers = [busy, free];
+  const klass = app.createClass("F1", level.id);
+  klass.requirements = [app.req("Math", 2, busy.id)];
+  state.classes = [klass];
+  app.normalizeAvailability();
+  busy.availability.Sunday = [false, false];
+
+  const pinned = app.buildCandidateSchedules();
+  check("honoring the pinned teacher breaks constraints", pinned[0]?.violations.length > 0);
+
+  state.constraints.honorFixedTeachers = false;
+  const dynamic = app.buildCandidateSchedules();
+  check("solver-picked teacher gives a perfect schedule", dynamic.length >= 1 && dynamic[0].violations.length === 0, JSON.stringify(dynamic[0]?.violations));
+  const lesson = dynamic[0].byClass[klass.id].Sunday.find(Boolean);
+  check("the better-fit teacher was chosen", lesson?.teacherId === free.id);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n9e. Branches: classes auto-formed from student counts");
+{
+  const level = app.createLevel("Third Sec", { days: ["Sunday", "Monday", "Tuesday"], periodsPerDay: 3, breakAfter: 0, breakLength: 0, classCount: 3, maxClassSize: 30 });
+  resetState({ levels: [level], settings: { candidateLimit: 4, maxTeacherPerDay: 6, maxSubjectPerDay: 2 } });
+  state.subjects = [
+    app.createSubject("Math", "Math", "core", "#176b5b", 5),
+    app.createSubject("Physics", "Phys", "core", "#c05621", 5),
+    app.createSubject("Drawing", "Draw", "light", "#2b6cb0", 2),
+  ];
+  state.teachers = [
+    app.createTeacher("MathT", ["Math"], 6),
+    app.createTeacher("PhysT", ["Physics"], 6),
+    app.createTeacher("DrawT", ["Drawing"], 6),
+  ];
+  const science = app.createBranch("Science", level.id, { studentCount: 40, requirements: [app.req("Math", 3), app.req("Physics", 3)] });
+  const art = app.createBranch("Art", level.id, { studentCount: 20, requirements: [app.req("Math", 2), app.req("Drawing", 4)] });
+  state.branches = [science, art];
+  app.syncBranchClasses();
+  app.normalizeAvailability();
+
+  check("3 classes formed (2 Science + 1 Art)", state.classes.length === 3, String(state.classes.length));
+  check("class names derived from branch", state.classes[0].name === "Third Sec Science 1", state.classes[0].name);
+  const sizes = state.classes.map((klass) => (klass.composition || []).reduce((sum, part) => sum + part.students, 0));
+  check("students split 20/20/20", JSON.stringify(sizes) === "[20,20,20]", JSON.stringify(sizes));
+  const artClass = state.classes.find((klass) => klass.branchId === art.id);
+  check("branch requirements flow to classes", app.classRequirements(artClass).find((r) => r.subject === "Drawing")?.count === 4);
+  check("Art branch does not take Physics", !app.classRequirements(artClass).some((r) => r.subject === "Physics" && r.count > 0));
+
+  const validation = app.validateSetup();
+  check("branch setup validates", validation.ok, validation.messages.join("; "));
+  const schedules = app.buildCandidateSchedules();
+  check("branch schedules solve perfectly", schedules.length >= 1 && schedules[0].violations.length === 0, JSON.stringify(schedules[0]?.violations));
+  check("independent verifier agrees", independentProblems(schedules[0]).length === 0, independentProblems(schedules[0]).join("; "));
+
+  level.classCount = 4;
+  app.syncBranchClasses();
+  check("raising the level class count re-packs into 4 classes", state.classes.filter((klass) => klass.branchId).length === 4);
+  level.classCount = 3;
+  app.syncBranchClasses();
+  check("lowering it packs back into 3", state.classes.filter((klass) => klass.branchId).length === 3);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n9i. Shared branches + choice subjects: mixed classes and pooled student groups");
+{
+  const level = app.createLevel("Sec3", {
+    days: ["Sunday", "Monday", "Tuesday"],
+    periodsPerDay: 4,
+    breakAfter: 0,
+    breakLength: 0,
+    classCount: 3,
+    minClassSize: 12,
+    maxClassSize: 25,
+  });
+  resetState({ levels: [level], settings: { candidateLimit: 4, maxTeacherPerDay: 6, maxSubjectPerDay: 2 } });
+  state.subjects = ["CoreA", "CoreB", "Math", "Physics", "Chemistry"].map((name, i) => app.createSubject(name, name.slice(0, 4), "core", ["#176b5b", "#c05621", "#2b6cb0", "#6b46c1", "#b83280"][i], 4));
+  state.teachers = [
+    app.createTeacher("CoreA T", ["CoreA"], 6),
+    app.createTeacher("CoreB T", ["CoreB"], 6),
+    app.createTeacher("Math T1", ["Math"], 6),
+    app.createTeacher("Math T2", ["Math"], 6),
+    app.createTeacher("Phys T", ["Physics"], 6),
+    app.createTeacher("Chem T", ["Chemistry"], 6),
+  ];
+  const eng = app.createBranch("Eng", level.id, {
+    studentCount: 15,
+    requirements: [app.req("CoreA", 3), app.req("CoreB", 3), Object.assign(app.req("Math", 3), { students: 5 }), Object.assign(app.req("Chemistry", 3), { students: 10 })],
+  });
+  const science = app.createBranch("Science", level.id, {
+    studentCount: 45,
+    shareWithBranchIds: [eng.id],
+    requirements: [app.req("CoreA", 3), app.req("CoreB", 3), Object.assign(app.req("Math", 3), { students: 25 }), Object.assign(app.req("Physics", 3), { students: 20 })],
+  });
+  state.branches = [science, eng];
+  app.syncBranchClasses();
+  app.normalizeAvailability();
+
+  const formed = state.classes.filter((klass) => klass.branchId);
+  check("3 classes formed", formed.length === 3, String(formed.length));
+  const mixedClass = formed.find((klass) => (klass.composition || []).length > 1);
+  check("one class mixes Science and Eng students", Boolean(mixedClass), JSON.stringify(formed.map((k) => k.composition)));
+  check("mixed class is Science 5 + Eng 15", JSON.stringify(mixedClass?.composition.map((p) => p.students)) === "[5,15]", JSON.stringify(mixedClass?.composition));
+  const mixedCommon = app.classRequirements(mixedClass).map((r) => r.subject).sort().join(",");
+  check("mixed class attends only common subjects together", mixedCommon === "CoreA,CoreB", mixedCommon);
+
+  const schedules = app.buildCandidateSchedules();
+  check("schedules generated", schedules.length >= 1);
+  const violations = schedules[0]?.violations || [];
+  check("exactly one broken constraint (Math overflow group below min)", violations.length === 1 && violations[0].type === "groupSize", JSON.stringify(violations.map((v) => `${v.type}: ${v.text}`)));
+  check("violation names Math group 2", violations[0]?.text.includes("Math group 2"), violations[0]?.text);
+  check("Chemistry group of 10 is exempt (total takers below minimum)", !violations.some((v) => v.text.includes("Chemistry")));
+
+  const first = schedules[0];
+  const secId = `sec_${level.id}`;
+  const choiceLessons = [];
+  level.days.forEach((day) => first.byClass[formed[0].id][day].forEach((lesson, slot) => {
+    if (lesson?.electiveRuleId === secId) choiceLessons.push({ day, slot, lesson });
+  }));
+  check("3 weekly choice blocks placed", choiceLessons.length === 3, String(choiceLessons.length));
+  const coTimed = choiceLessons.every(({ day, slot, lesson }) => formed.every((klass) => first.byClass[klass.id][day][slot]?.id === lesson.id));
+  check("choice blocks co-timed across all 3 classes", coTimed);
+  const partsOk = choiceLessons.every(({ lesson }) => lesson.parts.length === 4
+    && new Set(lesson.parts.map((part) => part.teacherId)).size === 4
+    && lesson.parts.filter((part) => part.subject === "Math").length === 2);
+  check("each block books 4 groups with 4 distinct teachers (2x Math)", partsOk, JSON.stringify(choiceLessons[0]?.lesson.parts.map((p) => `${p.subject}:${p.students}`)));
+  formed.forEach((klass) => {
+    const counts = {};
+    level.days.forEach((day) => first.byClass[klass.id][day].forEach((lesson) => {
+      if (lesson && !lesson.electiveRuleId) counts[lesson.subject] = (counts[lesson.subject] || 0) + 1;
+    }));
+    check(`${klass.name} attends CoreA x3 and CoreB x3 together`, counts.CoreA === 3 && counts.CoreB === 3, JSON.stringify(counts));
+  });
+  check("independent verifier agrees", independentProblems(first).length === 0, independentProblems(first).join("; "));
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n9f. Constraint priorities steer which constraint gets broken");
+{
+  const level = app.createLevel("Prio", { days: ["Sunday"], periodsPerDay: 2, breakAfter: 0, breakLength: 0 });
+  resetState({ levels: [level], settings: { candidateLimit: 4, maxTeacherPerDay: 6, maxSubjectPerDay: 1 } });
+  state.subjects = [app.createSubject("Math", "Math", "core", "#176b5b", 5)];
+  state.teachers = [app.createTeacher("PT", ["Math"], 6)];
+  const klass = app.createClass("P1", level.id);
+  klass.requirements = [app.req("Math", 1)];
+  state.classes = [klass];
+  app.normalizeAvailability();
+  state.teachers[0].availability.Sunday = [false, true];
+  klass.blocked.Sunday = [false, true];
+  // P1 breaks availability (weight 14), P2 breaks blocked slot (weight 12).
+
+  const defaults = app.buildCandidateSchedules();
+  check("by default the cheaper constraint breaks (blocked)", defaults[0]?.violations[0]?.type === "blocked", defaults[0]?.violations[0]?.type);
+
+  state.settings.constraintPriorities = { blocked: "high", availability: "low" };
+  const reprioritized = app.buildCandidateSchedules();
+  check("with blocked=high, availability breaks instead", reprioritized[0]?.violations[0]?.type === "availability", reprioritized[0]?.violations[0]?.type);
+  state.settings.constraintPriorities = {};
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n9g. Manual edits may break constraints and get flagged");
+{
+  const level = app.createLevel("Manual", { days: ["Sunday"], periodsPerDay: 3, breakAfter: 0, breakLength: 0 });
+  resetState({ levels: [level], settings: { candidateLimit: 2, maxTeacherPerDay: 6, maxSubjectPerDay: 1 } });
+  state.subjects = [app.createSubject("Math", "Math", "core", "#176b5b", 5)];
+  state.teachers = [app.createTeacher("MT", ["Math"], 6)];
+  const klass = app.createClass("M1", level.id);
+  klass.requirements = [app.req("Math", 1)];
+  state.classes = [klass];
+  app.normalizeAvailability();
+  state.teachers[0].availability.Sunday = [true, false, true];
+
+  const schedules = app.buildCandidateSchedules();
+  check("perfect schedule found", schedules[0]?.violations.length === 0);
+  const schedule = schedules[0];
+  const placed = ["Sunday"].flatMap((day) => schedule.byClass[klass.id][day].map((lesson, slot) => ({ lesson, slot })).filter((x) => x.lesson));
+  const collectionLike = { type: "class", id: klass.id, grid: schedule.byClass[klass.id] };
+  const error = app.attemptMoveOrSwap(schedule, placed[0].lesson.id, "Sunday", 1, collectionLike);
+  check("moving into an unavailable slot is allowed", error === "", error);
+  app.refreshScheduleMeta(schedule);
+  check("the broken constraint is flagged after the move", schedule.violations.length === 1 && schedule.violations[0].type === "availability", JSON.stringify(schedule.violations));
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n9h. Level-scoped teaching: same subject name, different levels");
+{
+  const level1 = app.createLevel("First Sec", { days: ["Sunday"], periodsPerDay: 2, breakAfter: 0, breakLength: 0 });
+  const level2 = app.createLevel("Second Sec", { days: ["Sunday"], periodsPerDay: 2, breakAfter: 0, breakLength: 0 });
+  resetState({ levels: [level1, level2], settings: { candidateLimit: 4, maxTeacherPerDay: 6, maxSubjectPerDay: 2 } });
+  state.subjects = [app.createSubject("Science", "Sci", "core", "#176b5b", 5)];
+  const junior = app.createTeacher("Junior Sci", ["Science"], 6);
+  const senior = app.createTeacher("Senior Sci", ["Science"], 6);
+  state.teachers = [junior, senior];
+  junior.subjectLevels = { Science: [level1.id] };
+  senior.subjectLevels = { Science: [level2.id] };
+  const class1 = app.createClass("1A", level1.id);
+  class1.requirements = [app.req("Science", 2)];
+  const class2 = app.createClass("2A", level2.id);
+  class2.requirements = [app.req("Science", 2)];
+  state.classes = [class1, class2];
+  app.normalizeAvailability();
+
+  check("scoped pools: only Junior teaches Science in First Sec",
+    JSON.stringify(state.teachers.filter((t) => t.subjects.includes("Science") && (!Array.isArray(t.subjectLevels.Science) || t.subjectLevels.Science.includes(level1.id))).map((t) => t.name)) === '["Junior Sci"]');
+
+  const schedules = app.buildCandidateSchedules();
+  check("both levels schedule perfectly", schedules.length >= 1 && schedules[0].violations.length === 0, JSON.stringify(schedules[0]?.violations));
+  const teacher1 = new Set(schedules[0].byClass[class1.id].Sunday.filter(Boolean).map((lesson) => lesson.teacherId));
+  const teacher2 = new Set(schedules[0].byClass[class2.id].Sunday.filter(Boolean).map((lesson) => lesson.teacherId));
+  check("First Sec Science taught by Junior only", teacher1.size === 1 && teacher1.has(junior.id));
+  check("Second Sec Science taught by Senior only", teacher2.size === 1 && teacher2.has(senior.id));
+
+  // Remove the senior teacher's scope entirely: Second Sec Science becomes
+  // unteachable, validation warns, and the fallback names the level.
+  senior.subjectLevels = { Science: [] };
+  const validation = app.validateSetup();
+  check("validation flags the level-less subject", validation.messages.some((m) => m.includes("no teacher teaches it in Second Sec")), validation.messages.join("; "));
+  const fallback = app.buildCandidateSchedules();
+  const unq = fallback[0]?.violations.find((v) => v.type === "unqualified");
+  check("fallback reports level-scoped unqualified teaching", Boolean(unq) && unq.text.includes("in Second Sec"), JSON.stringify(fallback[0]?.violations.map((v) => v.text)));
 }
 
 // ---------------------------------------------------------------------------
